@@ -60,10 +60,34 @@ def _should_clear_cache():
 
 
 def _get_tensor_content_hash(t):
-    """Get a stable hash for tensor identity based on storage properties."""
+    """Get a stable hash for tensor identity based on content, not memory address."""
     if not isinstance(t, torch.Tensor):
         return (id(t),)
-    return (t.shape, t.dtype, t.device, t.data_ptr(), t.storage_offset())
+    
+    # Use shape, dtype, device as base identity (stable across moves)
+    base_id = (t.shape, t.dtype, str(t.device))
+    
+    # For small tensors, hash a sample of values for stronger identity
+    # This prevents different tensors with same shape from colliding
+    if t.numel() <= _HASH_SAMPLE_COUNT:
+        # Hash all values for small tensors
+        try:
+            value_hash = hash(t.detach().cpu().numpy().tobytes())
+            return base_id + (value_hash,)
+        except:
+            pass
+    elif t.numel() > 0:
+        # Sample a few values for larger tensors
+        try:
+            sample_indices = [0, t.numel() // 4, t.numel() // 2, 3 * t.numel() // 4, t.numel() - 1]
+            sample_indices = [i for i in sample_indices if i < t.numel()]
+            samples = t.flatten()[sample_indices].detach().cpu().numpy().tobytes()
+            value_hash = hash(samples)
+            return base_id + (value_hash,)
+        except:
+            pass
+    
+    return base_id
 
 
 def _get_patch_identity(patches):
@@ -149,29 +173,74 @@ def _parse_patch(patch):
 
 
 def _identify_qkv_component(key: str) -> tuple:
-    """Identify which QKV component a LoRA key targets."""
+    """Identify which QKV component a LoRA key targets using word boundary-aware matching."""
     key_lower = key.lower()
     
-    fused_patterns = ['.qkv', '_qkv', '.to_qkv', '_to_qkv']
+    # Check for fused QKV patterns first (highest priority)
+    fused_patterns = ['.qkv.', '_qkv.', '.to_qkv.', '_to_qkv', 'qkv_proj']
     for pattern in fused_patterns:
         if pattern in key_lower:
             return (None, True)
     
-    q_patterns = ['.to_q.', '.q_proj.', '_q.', '.q.', '_attn_q', '/q/']
-    k_patterns = ['.to_k.', '.k_proj.', '_k.', '.k.', '_attn_k', '/k/']
-    v_patterns = ['.to_v.', '.v_proj.', '_v.', '.v.', '_attn_v', '/v/']
+    # Use more specific patterns with word boundaries to avoid false matches
+    # Order matters: check more specific patterns first
     
+    # Q patterns - from most specific to least specific
+    q_patterns = [
+        '.to_q.',      # Standard ComfyUI/Wan pattern
+        '_to_q_',      # Alternative separator
+        '.q_proj.',    # HuggingFace style
+        '_q_proj_',    # Alternative separator
+        '_attn_q',     # Short form attention
+        '/q/',         # Path style
+    ]
+    
+    k_patterns = [
+        '.to_k.',
+        '_to_k_',
+        '.k_proj.',
+        '_k_proj_',
+        '_attn_k',
+        '/k/',
+    ]
+    
+    v_patterns = [
+        '.to_v.',
+        '_to_v_',
+        '.v_proj.',
+        '_v_proj_',
+        '_attn_v',
+        '/v/',
+    ]
+    
+    # Check for Q (Query)
     for pattern in q_patterns:
-        if pattern in key_lower or key_lower.endswith(pattern.rstrip('.')):
-            return ('q', False)
+        if pattern in key_lower:
+            # Verify it's not a substring of a longer word (like 'query' containing 'q')
+            idx = key_lower.find(pattern)
+            if idx >= 0:
+                # Check if preceded by non-alphanumeric (or start of string)
+                before = key_lower[idx-1] if idx > 0 else None
+                if before is None or not before.isalnum():
+                    return ('q', False)
     
+    # Check for K (Key)
     for pattern in k_patterns:
-        if pattern in key_lower or key_lower.endswith(pattern.rstrip('.')):
-            return ('k', False)
+        if pattern in key_lower:
+            idx = key_lower.find(pattern)
+            if idx >= 0:
+                before = key_lower[idx-1] if idx > 0 else None
+                if before is None or not before.isalnum():
+                    return ('k', False)
     
+    # Check for V (Value)
     for pattern in v_patterns:
-        if pattern in key_lower or key_lower.endswith(pattern.rstrip('.')):
-            return ('v', False)
+        if pattern in key_lower:
+            idx = key_lower.find(pattern)
+            if idx >= 0:
+                before = key_lower[idx-1] if idx > 0 else None
+                if before is None or not before.isalnum():
+                    return ('v', False)
     
     return (None, False)
 
@@ -543,11 +612,27 @@ class LoRAWrapperModule(torch.nn.Module):
 
                 is_int8 = d.dtype == torch.int8 and u.dtype == torch.int8
                 if is_int8 and d_scale is not None and u_scale is not None:
+                    # Use stable content-based hash to avoid cache collisions from id() reuse
+                    def _get_scale_key(scale, name="scale"):
+                        if scale is None:
+                            return None
+                        if isinstance(scale, torch.Tensor):
+                            if scale.numel() == 1:
+                                return float(scale.item())
+                            # Use stable content hash instead of id()
+                            return _get_tensor_content_hash(scale)
+                        return float(scale)
+                    
+                    # Also include alpha in cache key for consistency
+                    alpha_key = float(a) if isinstance(a, (int, float)) else hash(str(a))
+                    
                     cache_key = (
                         "int8",
-                        _get_tensor_content_hash(d), _get_tensor_content_hash(u),
-                        _get_tensor_content_hash(d_scale), _get_tensor_content_hash(u_scale),
+                        d.shape, d.dtype, u.shape, u.dtype,
+                        _get_scale_key(d_scale, "down_scale"),
+                        _get_scale_key(u_scale, "up_scale"),
                         offset, size, original_out.shape[-1],
+                        alpha_key,  # Include alpha to prevent collision
                     )
 
                     def create_int8_cache(d=d, u=u, d_scale=d_scale, u_scale=u_scale, device=original_out.device):
@@ -562,19 +647,30 @@ class LoRAWrapperModule(torch.nn.Module):
                     if is_cached:
                         keys_to_release.add(cache_key)
 
-                    chunked_int8_lora_forward(
-                        x_2d, cached["d"], cached["u"],
-                        cached["d_scale"], cached["u_scale"],
-                        a, out, offset=offset, size=size
-                    )
-                    any_patch_applied = True
+                    try:
+                        chunked_int8_lora_forward(
+                            x_2d, cached["d"], cached["u"],
+                            cached["d_scale"], cached["u_scale"],
+                            a, out, offset=offset, size=size
+                        )
+                        any_patch_applied = True
+                    except Exception as e:
+                        # Release cache key on error to prevent reference count leak
+                        if cache_key in keys_to_release:
+                            self._lora_weight_cache.release(cache_key)
+                            keys_to_release.discard(cache_key)
+                        raise
                 else:
                     curr_x = x_2d if x_2d.dtype == original_out.dtype else x_2d.to(dtype=original_out.dtype)
 
+                    # Include alpha in cache key to prevent collision between patches with different alphas
+                    alpha_key = float(a) if isinstance(a, (int, float)) else hash(str(a))
+                    
                     cache_key = (
                         "float",
-                        _get_tensor_content_hash(d), _get_tensor_content_hash(u),
+                        d.shape, d.dtype, u.shape, u.dtype,
                         original_out.dtype, offset, size, original_out.shape[-1],
+                        alpha_key,  # Now includes alpha to prevent collision
                     )
 
                     def create_float_cache(d=d, u=u, device=original_out.device, dtype=original_out.dtype):
@@ -587,11 +683,18 @@ class LoRAWrapperModule(torch.nn.Module):
                     if is_cached:
                         keys_to_release.add(cache_key)
 
-                    chunked_lora_forward(
-                        curr_x, cached["d"], cached["u"],
-                        a, out, offset=offset, size=size
-                    )
-                    any_patch_applied = True
+                    try:
+                        chunked_lora_forward(
+                            curr_x, cached["d"], cached["u"],
+                            a, out, offset=offset, size=size
+                        )
+                        any_patch_applied = True
+                    except Exception as e:
+                        # Release cache key on error to prevent reference count leak
+                        if cache_key in keys_to_release:
+                            self._lora_weight_cache.release(cache_key)
+                            keys_to_release.discard(cache_key)
+                        raise
 
             if any_patch_applied:
                 return out
@@ -601,7 +704,10 @@ class LoRAWrapperModule(torch.nn.Module):
 
         finally:
             for key in keys_to_release:
-                self._lora_weight_cache.release(key)
+                try:
+                    self._lora_weight_cache.release(key)
+                except Exception:
+                    pass  # Ignore release errors in finally block
 
 
 class WanLoRALoader:
@@ -663,19 +769,14 @@ class WanLoRALoader:
 
             new_model = model.clone()
             
-            # Clear existing LoRA patches from INT8 modules.
-            # model.clone() shares the underlying model.model, so we need to
-            # ensure no patches from previous runs persist on shared modules.
+            # Clear stale patches from INT8 modules to ensure clean state
             torch_model_for_cleanup = new_model.model
             if hasattr(torch_model_for_cleanup, 'named_modules'):
-                cleared_count = 0
                 for name, mod in torch_model_for_cleanup.named_modules():
                     if hasattr(mod, 'lora_patches') and hasattr(mod, '_is_quantized'):
-                        if mod.lora_patches:
-                            mod.lora_patches = []
-                            cleared_count += 1
-                if cleared_count > 0:
-                    print(f"[LoRA] Cleared {cleared_count} existing patches from INT8 modules")
+                        mod.lora_patches = []
+                        if hasattr(mod, '_lora_weight_cache'):
+                            mod._lora_weight_cache.clear()
             del torch_model_for_cleanup
             
             with _object_patches_lock:
@@ -690,7 +791,6 @@ class WanLoRALoader:
                             value._lora_weight_cache.clear()
 
                             try:
-                                # Rebuild wrapper without deepcopying the wrapped module
                                 wrapped = value.wrapped_module
                                 patches = list(value.lora_patches) if value.lora_patches else []
                                 new_object_patches[key] = LoRAWrapperModule(wrapped, patches)
@@ -752,6 +852,7 @@ class WanLoRALoader:
 
                 patch_offset = 0
                 patch_size = 0
+                qkv_matched = False
 
                 for cand in candidates:
                     if cand in modules:
@@ -782,6 +883,7 @@ class WanLoRALoader:
                             if lora_out_dim == total_out:
                                 patch_offset = 0
                                 patch_size = 0
+                                qkv_matched = True
                                 if debug:
                                     print(f"Full QKV LoRA detected for {key}: out_dim={lora_out_dim}")
                             elif lora_out_dim == head_dim:
@@ -790,12 +892,15 @@ class WanLoRALoader:
                                 if component == 'q':
                                     patch_offset = 0
                                     patch_size = head_dim
+                                    qkv_matched = True
                                 elif component == 'k':
                                     patch_offset = head_dim
                                     patch_size = head_dim
+                                    qkv_matched = True
                                 elif component == 'v':
                                     patch_offset = head_dim * 2
                                     patch_size = head_dim
+                                    qkv_matched = True
                                 else:
                                     print(f"Warning: Could not determine Q/K/V type for partial LoRA key: {key}")
                                     target_module = None
@@ -822,13 +927,27 @@ class WanLoRALoader:
                         if patch_size > 0:
                             if patch_offset + patch_size > mod_out:
                                 if debug:
-                                    print(f"Warning: clamping patch for {key}")
+                                    print(f"Warning: clamping patch for {key} from offset={patch_offset}, size={patch_size} to fit mod_out={mod_out}")
                                 patch_size = max(0, mod_out - patch_offset)
+                            if patch_size <= 0:
+                                if debug:
+                                    print(f"Skipping {key}: Invalid patch size after clamping")
+                                continue
 
                         if mod_in != down.shape[1]:
                             if debug:
                                 print(f"Skipping {key}: Input mismatch {mod_in} vs {down.shape[1]}")
                             continue
+                        
+                        # Validate output dimension matches
+                        expected_out = patch_size if patch_size > 0 else mod_out
+                        if up.shape[0] != expected_out:
+                            if debug:
+                                print(f"Warning: {key} output dim mismatch: up.shape[0]={up.shape[0]}, expected={expected_out}")
+                            # Try to handle gracefully
+                            if up.shape[0] < expected_out:
+                                print(f"Skipping {key}: LoRA output {up.shape[0]} < expected {expected_out}")
+                                continue
 
                     patch_tuple = (down, up, alpha, down_scale, up_scale, patch_offset, patch_size)
                     patches_to_apply.append((target_key, target_module, patch_tuple))
@@ -845,8 +964,8 @@ class WanLoRALoader:
                 except ImportError:
                     return False
 
-            wrappers_to_add = []
-            int8_direct_patches = []
+            wrappers_to_add = {}
+            int8_direct_patches = {}
             
             for target_key, target_module, patch_tuple in patches_to_apply:
                 current_patches = []
@@ -873,30 +992,30 @@ class WanLoRALoader:
                     raw_module = raw_module.wrapped_module
 
                 if _is_int8_module(raw_module):
-                    # Apply patches directly to INT8 module
-                    int8_direct_patches.append((target_key, raw_module, new_patch_list))
+                    module_id = id(raw_module)
+                    if module_id not in int8_direct_patches:
+                        int8_direct_patches[module_id] = (target_key, raw_module, [])
+                    int8_direct_patches[module_id][2].append(patch_tuple)
                     if debug:
-                        print(f"[LoRA] Direct INT8 patch for {target_key}")
+                        print(f"[LoRA] Direct INT8 patch for {target_key} (accumulated {len(int8_direct_patches[module_id][2])} patches)")
                 else:
-                    # Use wrapper for non-INT8 modules
-                    wrapper = LoRAWrapperModule(raw_module, new_patch_list)
-                    wrappers_to_add.append((target_key, wrapper))
+                    if target_key not in wrappers_to_add:
+                        wrappers_to_add[target_key] = (raw_module, [])
+                    wrappers_to_add[target_key][1].append(patch_tuple)
                     if debug:
-                        print(f"[LoRA] Wrapper patch for {target_key}")
+                        print(f"[LoRA] Wrapper patch for {target_key} (accumulated {len(wrappers_to_add[target_key][1])} patches)")
 
             with _object_patches_lock:
-                for target_key, int8_module, patch_list in int8_direct_patches:
-                    # Clear existing patches before setting new ones to prevent accumulation.
-                    if int8_module.lora_patches:
-                        int8_module.lora_patches = []
+                for module_id, (target_key, int8_module, patch_list) in int8_direct_patches.items():
                     int8_module.lora_patches = patch_list
-                    patched_count += 1
+                    patched_count += len(patch_list)
                     if target_key not in new_model.object_patches:
                         new_model.add_object_patch(target_key, int8_module)
                 
-                for target_key, wrapper in wrappers_to_add:
+                for target_key, (raw_module, patch_list) in wrappers_to_add.items():
+                    wrapper = LoRAWrapperModule(raw_module, patch_list)
                     new_model.add_object_patch(target_key, wrapper)
-                    patched_count += 1
+                    patched_count += len(patch_list)
 
             int8_count = len(int8_direct_patches)
             wrapper_count = len(wrappers_to_add)

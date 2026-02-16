@@ -31,7 +31,7 @@ def _reshape_scale_for_matmul(scale: Tensor | float, rows: int, cols: int, ndim:
     if scale.numel() == 1:
         return scale.view(())
     if ndim == 1:
-        return scale.view(-1)  # vector
+        return scale.view(-1)
     if ndim == 2:
         if scale.numel() == rows:
             return scale.view(-1, 1)
@@ -51,7 +51,7 @@ def _chunked_apply_rows(
     chunk_rows: int,
     fn: Callable[[Tensor, int, int], Tensor],
 ) -> Tensor:
-    """Apply fn to row chunks. fn returns a tensor to write into out[start:end]."""
+    """Apply fn to row chunks, writing results to out[start:end]."""
     for start in range(0, x2d.shape[0], chunk_rows):
         end = min(start + chunk_rows, x2d.shape[0])
         out[start:end] = fn(x2d[start:end], start, end)
@@ -551,7 +551,6 @@ def _maybe_synchronize():
 
 if _DEBUG_MODE:
     def _log_memory(msg: str, is_forward: bool = False):
-        """Log GPU memory usage for OOM debugging."""
         if is_forward and not _DEBUG_FORWARD:
             return
         if torch.cuda.is_available():
@@ -561,7 +560,6 @@ if _DEBUG_MODE:
             print(f"[MEM] {msg}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Peak={max_mem:.2f}GB")
 
     def _log_tensor_size(name: str, t: Tensor, is_forward: bool = False):
-        """Log tensor size for OOM debugging."""
         if is_forward and not _DEBUG_FORWARD:
             return
         if torch.cuda.is_available():
@@ -756,7 +754,6 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
     chunk_rows = max(1, CHUNK_TARGET_ELEMENTS // max(down.shape[0], up.shape[0]))
     
     if x_2d.shape[0] <= chunk_rows:
-        # First stage: INT8 matmul x @ down^T
         x_int8, x_scale = quantize_int8_axiswise(x_2d, dim=-1)
         x_int8_contig = x_int8.contiguous() if not x_int8.is_contiguous() else x_int8
         down_T = down.T.contiguous() if not down.T.is_contiguous() else down.T
@@ -790,7 +787,6 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
             end = min(i + chunk_rows, x_2d.shape[0])
             x_chunk = x_2d[i:end]
             
-            # First stage: INT8 matmul x @ down^T
             x_int8, x_scale = quantize_int8_axiswise(x_chunk, dim=-1)
             x_int8_contig = x_int8.contiguous() if not x_int8.is_contiguous() else x_int8
             down_T = down.T.contiguous() if not down.T.is_contiguous() else down.T
@@ -939,7 +935,7 @@ if _COMFY_OPS_AVAILABLE:
                 unexpected_keys,
                 error_msgs,
             ):
-                """Directly load int8 weights and scales from state dict."""
+                """Load INT8 weights and scales directly from state dict."""
                 weight_key = prefix + "weight"
                 weight_scale_keys = [
                     prefix + "weight_scale",
@@ -1125,9 +1121,8 @@ if _COMFY_OPS_AVAILABLE:
                             is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
                             
                             if is_excluded or is_dim1:
-                                reason = "excluded" if is_excluded else "dim1/1D"
                                 if Int8TensorwiseOps.debug_mode:
-                                    print(f"Skipping dynamic quantization for {prefix.rstrip('.')} ({reason})")
+                                    print(f"Skipping dynamic quantization for {prefix.rstrip('.')} ({'excluded' if is_excluded else 'dim1/1D'})")
                                 self._is_quantized = False
                                 self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                                 _loading_stats["excluded"] += 1
@@ -1164,7 +1159,7 @@ if _COMFY_OPS_AVAILABLE:
                         unexpected_keys.remove(k)
             
             def forward(self, x: Tensor) -> Tensor:
-                """Fast forward using torch._int_mm for quantized weights."""
+                """Forward pass using torch._int_mm for quantized weights."""
                 if Int8TensorwiseOps.debug_mode and self._is_quantized:
                     if self.weight_scale is not None:
                         if isinstance(self.weight_scale, torch.Tensor):
@@ -1185,10 +1180,7 @@ if _COMFY_OPS_AVAILABLE:
                     acc_dtype = compute_dtype if (has_lora and Int8TensorwiseOps.offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
                     
                     if _DEBUG_MODE and has_lora:
-                        print(f"[DEBUG LoRA NON-QUANTIZED] Layer: {self}")
-                        print(f"[DEBUG LoRA NON-QUANTIZED]   x dtype: {x.dtype}")
-                        print(f"[DEBUG LoRA NON-QUANTIZED]   compute_dtype: {compute_dtype}")
-                        print(f"[DEBUG LoRA NON-QUANTIZED]   acc_dtype (for LoRA): {acc_dtype}")
+                        print(f"[DEBUG LoRA NON-QUANTIZED] {self}: x={x.dtype}, compute={compute_dtype}, acc={acc_dtype}")
                     
                     if _COMFY_OPS_AVAILABLE:
                         weight, bias, offload_stream = cast_bias_weight(
@@ -1216,31 +1208,44 @@ if _COMFY_OPS_AVAILABLE:
                         x_2d = x.reshape(-1, x_shape[-1])
                         
                         if _DEBUG_MODE:
-                            print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   x_2d dtype: {x_2d.dtype}")
-                            print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   out/base dtype: {out.dtype}")
+                            print(f"[DEBUG LoRA APPLY NON-QUANTIZED] x_2d={x_2d.dtype}, out={out.dtype}")
                         
                         if x_2d.dtype != out.dtype:
-                            if _DEBUG_MODE:
-                                print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   Casting x_2d from {x_2d.dtype} to {out.dtype}")
+                            _debug(f"[DEBUG LoRA APPLY NON-QUANTIZED] Casting x_2d from {x_2d.dtype} to {out.dtype}")
                             x_2d = x_2d.to(out.dtype)
                         
                         for idx, patch_data in enumerate(lora_patches):
-                            if len(patch_data) == 3:
-                                down, up, alpha = patch_data
-                                down_scale, up_scale = None, None
-                                offset, size = 0, 0
-                            elif len(patch_data) == 5:
-                                down, up, alpha, down_scale, up_scale = patch_data
-                                offset, size = 0, 0
-                            else:
-                                down, up, alpha, down_scale, up_scale, offset, size = patch_data
+                            if not isinstance(patch_data, (list, tuple)):
+                                if _DEBUG_MODE:
+                                    print(f"[DEBUG LoRA] Skipping invalid patch {idx}: not a list/tuple")
+                                continue
+                            
+                            if len(patch_data) < 3:
+                                if _DEBUG_MODE:
+                                    print(f"[DEBUG LoRA] Skipping invalid patch {idx}: needs at least 3 elements, got {len(patch_data)}")
+                                continue
+                            
+                            down, up, alpha = patch_data[0], patch_data[1], patch_data[2]
+                            down_scale, up_scale = None, None
+                            offset, size = 0, 0
+                            
+                            if len(patch_data) >= 5:
+                                down_scale, up_scale = patch_data[3], patch_data[4]
+                            if len(patch_data) >= 7:
+                                offset, size = patch_data[5], patch_data[6]
+                            elif len(patch_data) == 6:
+                                offset = patch_data[5]
+                                size = 0
+                            
+                            if not isinstance(down, torch.Tensor) or not isinstance(up, torch.Tensor):
+                                if _DEBUG_MODE:
+                                    print(f"[DEBUG LoRA] Skipping patch {idx}: down/up are not tensors")
+                                continue
                             
                             is_int8 = down.dtype == torch.int8 and up.dtype == torch.int8
                             
                             if _DEBUG_MODE:
-                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED] is_int8: {is_int8}")
-                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED]   down dtype: {down.dtype}, up dtype: {up.dtype}")
-                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED]   target dtype (out.dtype): {out.dtype}")
+                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED] is_int8={is_int8}, down={down.dtype}, up={up.dtype}, target={out.dtype}")
                             
                             if is_int8 and down_scale is not None and up_scale is not None:
                                 x_shape = x.shape
@@ -1253,8 +1258,8 @@ if _COMFY_OPS_AVAILABLE:
                                     up_scale_t = up_scale.to(device=out.device, non_blocking=True) if isinstance(up_scale, Tensor) else up_scale
                                     
                                     chunked_int8_lora_forward(
-                                        x_2d, down_int8, up_int8, 
-                                        down_scale_t, up_scale_t, 
+                                        x_2d, down_int8, up_int8,
+                                        down_scale_t, up_scale_t,
                                         alpha, out,
                                         offset=offset, size=size
                                     )
@@ -1301,11 +1306,10 @@ if _COMFY_OPS_AVAILABLE:
                                 del d, u
                     
                     if has_lora and out.dtype != compute_dtype:
-                        if _DEBUG_MODE:
-                            print(f"[DEBUG LoRA CAST NON-QUANTIZED] Casting output from {out.dtype} back to {compute_dtype}")
+                        _debug(f"[DEBUG LoRA CAST NON-QUANTIZED] Casting output from {out.dtype} to {compute_dtype}")
                         out = out.to(compute_dtype)
                     elif _DEBUG_MODE and has_lora:
-                        print(f"[DEBUG LoRA CAST NON-QUANTIZED] Output already in compute_dtype: {compute_dtype}")
+                        print(f"[DEBUG LoRA CAST NON-QUANTIZED] Output already in {compute_dtype}")
                     
                     return out
                 
@@ -1324,15 +1328,7 @@ if _COMFY_OPS_AVAILABLE:
                     bias = bias.to(acc_dtype)
                 
                 if _DEBUG_MODE and has_lora:
-                    print(f"[DEBUG LoRA] Layer: {self}")
-                    print(f"[DEBUG LoRA]   x dtype: {x.dtype}")
-                    print(f"[DEBUG LoRA]   compute_dtype: {compute_dtype}")
-                    print(f"[DEBUG LoRA]   acc_dtype (for LoRA): {acc_dtype}")
-                    print(f"[DEBUG LoRA]   weight dtype: {weight.dtype}")
-                    if bias is not None:
-                        print(f"[DEBUG LoRA]   bias dtype: {bias.dtype}")
-                    else:
-                        print(f"[DEBUG LoRA]   bias: None")
+                    print(f"[DEBUG LoRA] Layer: {self}, x={x.dtype}, compute={compute_dtype}, acc={acc_dtype}, weight={weight.dtype}, bias={bias.dtype if bias is not None else None}")
                 
                 if self._hadamard_quip and x_2d.shape[0] > 16:
                     hadamard_kernels = _get_hadamard_quip_kernels()
@@ -1350,14 +1346,12 @@ if _COMFY_OPS_AVAILABLE:
                             needs_padding = True
                         
                         if needs_padding:
-                            if _DEBUG_MODE:
-                                print(f"[DIAG] Padding weight from {weight.shape} to Hadamard dimensions")
+                            _debug(f"[DIAG] Padding weight from {weight.shape} to Hadamard dimensions")
                             if self._hadamard_size_out > 0 and N < self._hadamard_size_out:
                                 weight = torch.nn.functional.pad(weight, (0, 0, 0, self._hadamard_size_out - N))
                             if self._hadamard_size_in > 0 and K < self._hadamard_size_in:
                                 weight = torch.nn.functional.pad(weight, (0, self._hadamard_size_in - K, 0, 0))
-                            if _DEBUG_MODE:
-                                print(f"[DIAG] Padded weight shape: {weight.shape}")
+                            _debug(f"[DIAG] Padded weight shape: {weight.shape}")
                         
                         if sign_row is not None and sign_row.device != x_2d.device:
                             sign_row = sign_row.to(x_2d.device)
@@ -1365,13 +1359,11 @@ if _COMFY_OPS_AVAILABLE:
                             sign_col = sign_col.to(x_2d.device)
                         
                         if _DEBUG_MODE:
-                            print(f"[DIAG] Hadamard-QuIP forward for layer")
-                            print(f"[DIAG]   x_2d device: {x_2d.device}")
-                            print(f"[DIAG]   weight device: {weight.device}")
+                            print(f"[DIAG] Hadamard-QuIP forward: x_2d={x_2d.device}, weight={weight.device}")
                             if sign_row is not None:
-                                print(f"[DIAG]   sign_row device: {sign_row.device}, shape: {sign_row.shape}")
+                                print(f"[DIAG]   sign_row={sign_row.device}, shape={tuple(sign_row.shape)}")
                             if sign_col is not None:
-                                print(f"[DIAG]   sign_col device: {sign_col.device}, shape: {sign_col.shape}")
+                                print(f"[DIAG]   sign_col={sign_col.device}, shape={tuple(sign_col.shape)}")
                         
                         try:
                             _log_kernel_usage("hadamard_quip_triton", self.__class__.__name__)
@@ -1385,27 +1377,19 @@ if _COMFY_OPS_AVAILABLE:
                                 use_fp32_output=has_lora
                             )
                             if y.shape[-1] != self.out_features:
-                                if _DEBUG_MODE:
-                                    print(f"[DIAG] Slicing output from {y.shape[-1]} to {self.out_features}")
+                                _debug(f"[DIAG] Slicing output from {y.shape[-1]} to {self.out_features}")
                                 y = y[:, :self.out_features]
                         except Exception as e:
-                            print(f"[DIAG FALLBACK] Triton failed with: {type(e).__name__}: {e}")
+                            print(f"[DIAG FALLBACK] Triton failed: {type(e).__name__}: {e}")
                             if torch.cuda.is_available():
                                 allocated = torch.cuda.memory_allocated() / 1024**3
                                 reserved = torch.cuda.memory_reserved() / 1024**3
                                 total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-                                print(f"[DIAG FALLBACK] Memory at failure: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Total={total:.2f}GB")
-                                print(f"[DIAG FALLBACK] Hadamard sizes: in={self._hadamard_size_in}, out={self._hadamard_size_out}")
-                                print(f"[DIAG FALLBACK] Input shape: {x_2d.shape}, weight shape: {weight.shape}")
-                            
-                            if torch.cuda.is_available():
-                                print(f"[DIAG FALLBACK] Clearing CUDA cache before PyTorch fallback...")
+                                print(f"[DIAG FALLBACK] Memory: Alloc={allocated:.2f}GB, Res={reserved:.2f}GB, Total={total:.2f}GB")
+                                print(f"[DIAG FALLBACK] Shapes: input={tuple(x_2d.shape)}, weight={tuple(weight.shape)}, Hadamard={self._hadamard_size_in}/{self._hadamard_size_out}")
                                 torch.cuda.empty_cache()
-                                allocated_after = torch.cuda.memory_allocated() / 1024**3
-                                print(f"[DIAG FALLBACK] After cache clear: Allocated={allocated_after:.2f}GB")
-                            
-                            if Int8TensorwiseOps.debug_mode:
-                                print(f"[DEBUG] Hadamard-QuIP Triton failed, falling back to PyTorch: {e}")
+                                print(f"[DIAG FALLBACK] Cache cleared, retrying with PyTorch...")
+                            _debug(f"[DEBUG] Hadamard-QuIP Triton failed, falling back to PyTorch: {e}")
                             try:
                                 _log_kernel_usage("hadamard_quip_pytorch", self.__class__.__name__)
                                 y = pytorch_hadamard_quip_linear(
@@ -1417,13 +1401,11 @@ if _COMFY_OPS_AVAILABLE:
                                     out_features=self.out_features
                                 )
                                 if y.shape[-1] != self.out_features:
-                                    if _DEBUG_MODE:
-                                        print(f"[DIAG] Slicing output from {y.shape[-1]} to {self.out_features}")
+                                    _debug(f"[DIAG] Slicing output from {y.shape[-1]} to {self.out_features}")
                                     y = y[:, :self.out_features]
                                 print(f"[DIAG FALLBACK] PyTorch fallback succeeded!")
                             except torch.OutOfMemoryError as oom_e:
-                                print(f"[DIAG FALLBACK] PyTorch fallback ALSO FAILED with OOM!")
-                                print(f"[DIAG FALLBACK] PyTorch OOM: {oom_e}")
+                                print(f"[DIAG FALLBACK] PyTorch fallback also failed with OOM: {oom_e}")
                                 raise
                     else:
                         _log_kernel_usage("hadamard_quip_dequant", self.__class__.__name__)
@@ -1491,39 +1473,47 @@ if _COMFY_OPS_AVAILABLE:
                     _log_memory(f"before LoRA application ({len(lora_patches)} patches)", is_forward=True)
                     
                     if _DEBUG_MODE:
-                        print(f"[DEBUG LoRA APPLY] Layer quantized: {self._is_quantized}")
-                        print(f"[DEBUG LoRA APPLY]   x dtype: {x.dtype}")
-                        print(f"[DEBUG LoRA APPLY]   x_2d dtype: {x_2d.dtype}")
-                        print(f"[DEBUG LoRA APPLY]   y/base dtype: {y.dtype}")
-                        print(f"[DEBUG LoRA APPLY]   compute_dtype: {compute_dtype}")
-                        print(f"[DEBUG LoRA APPLY]   acc_dtype used: {acc_dtype}")
+                        print(f"[DEBUG LoRA APPLY] quantized={self._is_quantized}, x={x.dtype}, x_2d={x_2d.dtype}, y={y.dtype}, compute={compute_dtype}, acc={acc_dtype}")
                     
                     if x_2d.dtype != y.dtype:
-                        if _DEBUG_MODE:
-                            print(f"[DEBUG LoRA APPLY]   Casting x_2d from {x_2d.dtype} to {y.dtype}")
+                        _debug(f"[DEBUG LoRA APPLY] Casting x_2d from {x_2d.dtype} to {y.dtype}")
                         x_2d = x_2d.to(y.dtype)
                     
                     for idx, patch_data in enumerate(lora_patches):
-                        if len(patch_data) == 3:
-                            down, up, alpha = patch_data
-                            down_scale, up_scale = None, None
-                            offset, size = 0, 0
-                        elif len(patch_data) == 5:
-                            down, up, alpha, down_scale, up_scale = patch_data
-                            offset, size = 0, 0
-                        else:
-                            down, up, alpha, down_scale, up_scale, offset, size = patch_data
+                        if not isinstance(patch_data, (list, tuple)):
+                            if _DEBUG_MODE:
+                                print(f"[DEBUG LoRA] Skipping invalid patch {idx}: not a list/tuple")
+                            continue
+                        
+                        if len(patch_data) < 3:
+                            if _DEBUG_MODE:
+                                print(f"[DEBUG LoRA] Skipping invalid patch {idx}: needs at least 3 elements, got {len(patch_data)}")
+                            continue
+                        
+                        down, up, alpha = patch_data[0], patch_data[1], patch_data[2]
+                        down_scale, up_scale = None, None
+                        offset, size = 0, 0
+                        
+                        if len(patch_data) >= 5:
+                            down_scale, up_scale = patch_data[3], patch_data[4]
+                        if len(patch_data) >= 7:
+                            offset, size = patch_data[5], patch_data[6]
+                        elif len(patch_data) == 6:
+                            offset = patch_data[5]
+                            size = 0
+                        
+                        if not isinstance(down, torch.Tensor) or not isinstance(up, torch.Tensor):
+                            if _DEBUG_MODE:
+                                print(f"[DEBUG LoRA] Skipping patch {idx}: down/up are not tensors")
+                            continue
                         
                         is_int8 = down.dtype == torch.int8 and up.dtype == torch.int8
                         
                         if _DEBUG_MODE:
-                            print(f"[DEBUG LoRA PATCH {idx}] is_int8: {is_int8}")
-                            print(f"[DEBUG LoRA PATCH {idx}]   down dtype: {down.dtype}, shape: {down.shape}")
-                            print(f"[DEBUG LoRA PATCH {idx}]   up dtype: {up.dtype}, shape: {up.shape}")
+                            print(f"[DEBUG LoRA PATCH {idx}] is_int8={is_int8}, down={down.dtype}{tuple(down.shape)}, up={up.dtype}{tuple(up.shape)}")
                             if is_int8:
-                                print(f"[DEBUG LoRA PATCH {idx}]   down_scale: {down_scale}, up_scale: {up_scale}")
-                            print(f"[DEBUG LoRA PATCH {idx}]   target dtype (y.dtype): {y.dtype}")
-                            print(f"[DEBUG LoRA PATCH {idx}]   alpha: {alpha}")
+                                print(f"[DEBUG LoRA PATCH {idx}]   scales: down={down_scale}, up={up_scale}")
+                            print(f"[DEBUG LoRA PATCH {idx}]   target={y.dtype}, alpha={alpha}")
                         
                         if is_int8 and down_scale is not None and up_scale is not None:
                             _log_memory(f"INT8 LoRA {idx} start", is_forward=True)
@@ -1584,11 +1574,10 @@ if _COMFY_OPS_AVAILABLE:
                     _log_memory("after LoRA application", is_forward=True)
 
                 if has_lora and y.dtype != compute_dtype:
-                    if _DEBUG_MODE:
-                        print(f"[DEBUG LoRA CAST] Casting output from {y.dtype} back to {compute_dtype}")
+                    _debug(f"[DEBUG LoRA CAST] Casting output from {y.dtype} to {compute_dtype}")
                     y = y.to(compute_dtype)
                 elif _DEBUG_MODE and has_lora:
-                    print(f"[DEBUG LoRA CAST] Output already in compute_dtype: {compute_dtype}")
+                    print(f"[DEBUG LoRA CAST] Output already in {compute_dtype}")
 
                 del weight, weight_scale, input_scale, bias
                 
