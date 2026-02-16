@@ -28,7 +28,7 @@ class WanVideoINT8Loader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "model_type": (["wan2.2", "wan2.1", "flux2", "z-image", "chroma", "ltx2", "qwen", "anima"],),
+                "model_type": (["wan", "flux2", "z-image", "chroma", "ltx2", "qwen", "anima"],),
                 "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
                 "auto_convert_to_int8": (["enable", "disable"], {"default": "enable"}),
                 "debug_mode": ("BOOLEAN", {"default": False}),
@@ -95,7 +95,7 @@ class WanVideoINT8Loader:
                 'final_layer', 'noise_refiner', 'adaLN',
                 'x_pad_token',
             ]
-        elif model_type in ["wan2.1", "wan2.2"]:
+        elif model_type == "wan":
             Int8TensorwiseOps.excluded_names = [
                 'patch_embed', 'text_projection', 'time_projection', 'head',
                 'modulation', 'guidance', 'img_emb', 'txt_emb', 'time_emb',
