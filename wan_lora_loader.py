@@ -191,6 +191,7 @@ def _identify_qkv_component(key: str) -> tuple:
     # Order matters: check more specific patterns first
     
     # Q patterns - from most specific to least specific
+    # Patterns with trailing delimiter (middle of path)
     q_patterns = [
         '.to_q.',      # Standard ComfyUI/Wan pattern
         '_to_q_',      # Alternative separator
@@ -218,31 +219,49 @@ def _identify_qkv_component(key: str) -> tuple:
         '/v/',
     ]
     
+    def _check_pattern(key: str, pattern: str) -> bool:
+        """Check if pattern exists with proper word boundaries."""
+        idx = key.find(pattern)
+        if idx < 0:
+            return False
+        
+        # Check if preceded by non-alphanumeric (or start of string)
+        before = key[idx-1] if idx > 0 else None
+        if before is not None and before.isalnum():
+            return False
+        
+        return True
+    
+    # Check middle-of-path patterns first
     for pattern in q_patterns:
-        if pattern in key_lower:
-            # Verify it's not a substring of a longer word (like 'query' containing 'q')
-            idx = key_lower.find(pattern)
-            if idx >= 0:
-                # Check if preceded by non-alphanumeric (or start of string)
-                before = key_lower[idx-1] if idx > 0 else None
-                if before is None or not before.isalnum():
-                    return ('q', False)
+        if _check_pattern(key_lower, pattern):
+            return ('q', False)
     
     for pattern in k_patterns:
-        if pattern in key_lower:
-            idx = key_lower.find(pattern)
-            if idx >= 0:
-                before = key_lower[idx-1] if idx > 0 else None
-                if before is None or not before.isalnum():
-                    return ('k', False)
+        if _check_pattern(key_lower, pattern):
+            return ('k', False)
     
     for pattern in v_patterns:
-        if pattern in key_lower:
-            idx = key_lower.find(pattern)
-            if idx >= 0:
-                before = key_lower[idx-1] if idx > 0 else None
-                if before is None or not before.isalnum():
-                    return ('v', False)
+        if _check_pattern(key_lower, pattern):
+            return ('v', False)
+    
+    # Check end-of-key patterns using endswith() - simpler and more reliable
+    # Order matters: check more specific patterns first
+    q_end_patterns = ['.to_q', '_to_q', '.q_proj', '_q_proj']
+    k_end_patterns = ['.to_k', '_to_k', '.k_proj', '_k_proj']
+    v_end_patterns = ['.to_v', '_to_v', '.v_proj', '_v_proj']
+    
+    for pattern in q_end_patterns:
+        if key_lower.endswith(pattern):
+            return ('q', False)
+    
+    for pattern in k_end_patterns:
+        if key_lower.endswith(pattern):
+            return ('k', False)
+    
+    for pattern in v_end_patterns:
+        if key_lower.endswith(pattern):
+            return ('v', False)
     
     return (None, False)
 
