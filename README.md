@@ -8,16 +8,29 @@ This is a fork of the original Flux INT8 Acceleration project with additional fe
 
 ## Features
 
-### W8A8 Triton Kernel
-Custom W8A8 (8-bit weights, 8-bit activations) Triton kernel for optimized INT8 inference. The kernel performs fused quantization, matrix multiplication, and dequantization for improved performance on supported GPUs.
+### W8A8 Triton Kernels
+Custom W8A8 (8-bit weights, 8-bit activations) Triton kernels for optimized INT8 inference. Supports both **tensorwise** and **blockwise** quantization modes with fused quantization, matrix multiplication, and dequantization for improved performance on supported GPUs.
 
 **GPU Architecture Support:**
-- **Ampere** (RTX 30xx, A100) - Optimized autotuned kernel with `tl.make_block_ptr` pipelining
-- **Ada** (RTX 40xx) - Uses Ampere kernel with Ada-friendly configs
-- **Turing** (RTX 20xx) - Fallback kernel with safe configurations
-- **Older GPUs** - Fixed fallback kernel
+- **Ampere** (RTX 30xx, A100) - Optimized autotuned kernels with `tl.make_block_ptr` pipelining, including dedicated blockwise kernel
+- **Ada** (RTX 40xx) - Uses Ampere kernels with Ada-friendly configs
+- **Turing** (RTX 20xx) - Fallback kernels with safe configurations
+- **Older GPUs** - Fixed fallback kernels
 
-The kernel automatically selects the best implementation based on your GPU's compute capability.
+The kernel automatically selects the best implementation based on your GPU's compute capability and the model's quantization format.
+
+### Blockwise Quantization
+Blockwise quantization provides finer-grained scaling by using per-block scale factors instead of per-tensor or per-channel scales.
+
+**Scale Format:**
+- Blockwise scales have shape `[N, num_blocks, 1]` where `num_blocks = K // block_size`
+- Example: For weights `[3072, 27648]` with `block_size=128` → scales `[3072, 216, 1]`
+- Automatically detected from model scale shape (3D = blockwise, 1D/2D = tensorwise)
+
+**Benefits:**
+- Potentially better precision than tensorwise quantization
+- Supported by both standard and Ampere-optimized Triton kernels
+- Seamless fallback to dequantize + matmul if Triton kernel fails
 
 ### Supported Models
 
@@ -35,7 +48,10 @@ The following pre-quantized models are available and functional:
 | Z-Image | ✅ Supported | Includes Diffusers format conversion |
 
 ### INT8 Quantization
-QuIP quantization is recommended because it typically offers high precision and tends to work well with LoRA adapters, primarily when applied to transformer-based models. Use the [convert_to_quant_QuIP_INT8](https://github.com/ThunderFun/convert_to_quant_QuIP_INT8) project to quantize your models.
+QuIP quantization is recommended because it typically offers high precision and tends to work well with LoRA adapters, primarily when applied to transformer-based models. Both **tensorwise** and **blockwise** quantized models are supported. Use the [convert_to_quant_QuIP_INT8](https://github.com/ThunderFun/convert_to_quant_QuIP_INT8) project to quantize your models.
+
+- **Tensorwise**: Uses per-channel or per-tensor scales (1D or 2D scale tensors)
+- **Blockwise**: Uses per-block scales (3D scale tensors) for finer-grained quantization
 
 ### CPU Offloading (Optional)
 Optional CPU offloading can be enabled via node settings. When enabled, float LoRA weights are kept on CPU and moved to GPU during inference to save VRAM. **Note:** This feature may exhibit bugs when enabled.
@@ -75,14 +91,20 @@ pip install triton
 ## Available Nodes
 
 ### WanVideoINT8Loader
-Loads INT8 tensorwise quantized diffusion models with fast torch._int_mm inference.
+Loads INT8 quantized diffusion models (tensorwise or blockwise) with fast Triton kernel inference.
 
 **Inputs:**
 - `unet_name`: Select from available diffusion models
 - `model_type`: Choose from `wan2.2`, `wan2.1`, `flux2`, or `z-image`
+- `quantization_mode`: Select quantization mode - `auto` (detect from model), `tensorwise`, or `blockwise`
 - `offload_to_cpu`: Enable/disable CPU offloading for float weights
 - `auto_convert_to_int8`: Automatically convert non-INT8 weights to INT8
 - `debug_mode`: Enable detailed debug output
+
+**Quantization Modes:**
+- `auto` (default): Automatically detects format from model scale shape
+- `tensorwise`: Forces tensor-wise quantization (1D/2D scales)
+- `blockwise`: Forces block-wise quantization (3D scales), errors if model doesn't support it
 
 ### WanLoRALoaderINT8
 Loads and applies LoRA weights to INT8 models.
@@ -103,6 +125,7 @@ Same as WanLoRALoaderINT8 but with CLIP support for conditioned models.
 |----------|---------|-------------|
 | `INT8_HADAMARD_QUIP` | `0` | Enable Hadamard-QuIP kernel |
 | `INT8_DISABLE_HADAMARD_QUIP` | ` ` | Force disable Hadamard-QuIP |
+| `INT8_DISABLE_BLOCKWISE` | ` ` | Force disable blockwise kernel (fallback to tensorwise) |
 | `INT8_DEBUG_MODE` | `0` | Enable debug logging |
 | `INT8_ENABLE_CUDA_SYNC` | `0` | Enable CUDA synchronization for debugging |
 | `INT8_CLEAR_CACHE` | `auto` | CUDA cache clearing strategy (`always`/`never`/`auto`) |
@@ -139,6 +162,8 @@ See [Workflow.png](Workflow.png) for an example ComfyUI workflow setup.
 - This node is unlikely to be faster than proper FP8 on 40-Series and above GPUs
 - Works best with torch.compile enabled for full speedup
 - LoRA support may add overhead depending on rank and number of patches
+- **Blockwise on Ampere**: Dedicated Ampere-optimized blockwise kernel provides improved performance on RTX 30xx and A100 GPUs
+- Blockwise quantization may have different VRAM usage characteristics compared to tensorwise
 
 ## Troubleshooting
 
@@ -155,6 +180,12 @@ See [Workflow.png](Workflow.png) for an example ComfyUI workflow setup.
 ### LoRA Not Applying
 - Verify LoRA dimensions match the target model
 - Check debug output for dimension mismatch warnings
+
+### Blockwise Quantization Issues
+- If blockwise kernel fails, it automatically falls back to dequantize + standard matmul
+- Use `quantization_mode=tensorwise` to force tensorwise mode for a blockwise model
+- Set `INT8_DISABLE_BLOCKWISE=1` to globally disable blockwise kernels
+- Check that your model actually has blockwise scales (3D scale tensors) if using `quantization_mode=blockwise`
 
 ## Credits
 

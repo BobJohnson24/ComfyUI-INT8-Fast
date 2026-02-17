@@ -29,6 +29,7 @@ class WanVideoINT8Loader:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "model_type": (["wan", "flux2", "z-image", "chroma", "ltx2", "qwen", "anima"],),
+                "quantization_mode": (["auto", "tensorwise", "blockwise"], {"default": "auto"}),
                 "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
                 "auto_convert_to_int8": (["enable", "disable"], {"default": "enable"}),
                 "debug_mode": ("BOOLEAN", {"default": False}),
@@ -40,7 +41,7 @@ class WanVideoINT8Loader:
     CATEGORY = "WanVideo/INT8"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, model_type, offload_to_cpu, auto_convert_to_int8, debug_mode):
+    def load_unet(self, unet_name, model_type, quantization_mode, offload_to_cpu, auto_convert_to_int8, debug_mode):
         import comfy.model_management
         import gc
         from comfy.sd import load_diffusion_model
@@ -76,6 +77,7 @@ class WanVideoINT8Loader:
         Int8TensorwiseOps.offload_to_cpu = offload_enabled
         
         Int8TensorwiseOps.auto_convert_to_int8 = (auto_convert_to_int8 == "enable")
+        Int8TensorwiseOps.quantization_mode = quantization_mode
         
         Int8TensorwiseOps.excluded_names = []
         _loading_stats["int8_direct"] = 0

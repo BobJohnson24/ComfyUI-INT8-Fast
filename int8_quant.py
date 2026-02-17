@@ -75,6 +75,7 @@ except ImportError:
     pass
 
 _triton_kernels = None
+_triton_blockwise_kernels = None
 _hadamard_quip_kernels = None
 
 def _get_triton_kernels():
@@ -91,6 +92,24 @@ def _get_triton_kernels():
             if _DEBUG_MODE:
                 print(f"[DEBUG] Unexpected error importing triton kernels: {type(e).__name__}: {e}")
     return _triton_kernels
+
+
+def _get_triton_blockwise_kernels():
+    """Lazy import of block-wise Triton kernels."""
+    global _triton_blockwise_kernels
+    if _triton_blockwise_kernels is None and _TRITON_AVAILABLE:
+        try:
+            # Try relative import first (when imported as package)
+            from .triton_kernels import triton_blockwise_int8_linear
+            _triton_blockwise_kernels = triton_blockwise_int8_linear
+        except Exception:
+            try:
+                # Try absolute import (when run directly)
+                from triton_kernels import triton_blockwise_int8_linear
+                _triton_blockwise_kernels = triton_blockwise_int8_linear
+            except Exception:
+                pass
+    return _triton_blockwise_kernels
 
 
 def _get_hadamard_quip_kernels():
@@ -218,12 +237,46 @@ def _apply_hadamard_transform(w: Tensor, hadamard_size: int, sign_vec: Tensor | 
 
 def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None, quip_s_v: Tensor | None = None,
                hadamard_quip: bool = False, hadamard_size_in: int = 0, hadamard_size_out: int = 0,
-               sign_row: Tensor | None = None, sign_col: Tensor | None = None) -> Tensor:
-    """Dequantize INT8 tensor to float."""
+               sign_row: Tensor | None = None, sign_col: Tensor | None = None,
+               use_blockwise: bool = False) -> Tensor:
+    """Dequantize INT8 tensor to float.
+    
+    Args:
+        q: Quantized INT8 tensor.
+        scale: Scale factor (scalar, per-channel, or block-wise [N, num_blocks, 1]).
+        quip_s_u: QuIP dense rotation matrix U (for legacy QuIP#).
+        quip_s_v: QuIP dense rotation matrix V (for legacy QuIP#).
+        hadamard_quip: Whether to use Hadamard-QuIP dequantization.
+        hadamard_size_in: Size of Hadamard transform for input dimension.
+        hadamard_size_out: Size of Hadamard transform for output dimension.
+        sign_row: Row signs for Hadamard-QuIP (diagonal D1).
+        sign_col: Column signs for Hadamard-QuIP (diagonal D2).
+        use_blockwise: Whether to use block-wise dequantization for 3D scales.
+    
+    Returns:
+        Dequantized float tensor.
+    """
     total_elements = q.numel()
 
     rows = q.shape[0] if q.ndim >= 1 else 1
     cols = q.shape[1] if q.ndim >= 2 else 1
+
+    # Handle block-wise dequantization for 3D scales [N, num_blocks, 1]
+    if use_blockwise and isinstance(scale, Tensor) and scale.ndim == 3:
+        M, num_blocks, _ = scale.shape
+        N = q.shape[1] if q.ndim >= 2 else q.shape[0] // M
+        block_size = N // num_blocks
+        
+        if q.ndim == 2:
+            # Reshape weight: [M, N] -> [M, num_blocks, block_size]
+            weight_blocked = q.reshape(M, num_blocks, block_size)
+            # Apply scale: [M, num_blocks, 1] broadcasts over block_size
+            dequant = (weight_blocked.float() * scale).reshape(M, N)
+        else:
+            # Handle 1D case
+            dequant = q.float() * scale.view(-1)
+        
+        return dequant
 
     # Handle 1D safely (bypass Hadamard/QuIP paths)
     if q.ndim == 1:
@@ -578,7 +631,11 @@ else:
 def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None,
                          compute_dtype: torch.dtype, chunk_size: int = 0,
                          has_lora: bool = False, offload_to_cpu: bool = False) -> Tensor:
-    """Forward with dynamic per-token activation quantization."""
+    """Forward with dynamic per-token activation quantization.
+    
+    Supports block-wise scales by routing to specialized Triton kernels when
+    weight_scale has 3D shape [N, num_blocks, 1].
+    """
     output_dtype = compute_dtype if (has_lora and offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
 
     x_shape = x.shape
@@ -594,6 +651,29 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
 
     x = x_2d
     _check_nan_inf(x, "input x", "int8_forward_dynamic")
+    
+    # Detect block-wise scales [N, num_blocks, 1] and route to block-wise kernel
+    if isinstance(weight_scale, Tensor) and weight_scale.ndim == 3:
+        _debug(f"[DEBUG] Block-wise scale detected: {weight_scale.shape}")
+        
+        # Check if block-wise kernel is disabled
+        if os.environ.get("INT8_DISABLE_BLOCKWISE", "0") == "1":
+            _debug(f"[DEBUG] Block-wise kernel disabled by env var, using fallback")
+            weight_dequant = dequantize(weight, weight_scale, use_blockwise=True)
+            return F.linear(x, weight_dequant.to(compute_dtype), bias)
+        
+        blockwise_kernel = _get_triton_blockwise_kernels()
+        if blockwise_kernel is not None and x.ndim >= 2:
+            try:
+                _log_kernel_usage("w8a8_blockwise_triton", "int8_forward_dynamic")
+                return blockwise_kernel(x, weight, weight_scale, bias, compute_dtype)
+            except Exception as e:
+                _debug(f"[DEBUG] Block-wise Triton fallback: {type(e).__name__}: {e}")
+        
+        # Fallback: dequantize then compute
+        _log_kernel_usage("dequant_blockwise_fallback", "int8_forward_dynamic")
+        weight_dequant = dequantize(weight, weight_scale, use_blockwise=True)
+        return F.linear(x, weight_dequant.to(compute_dtype), bias)
 
     triton_kernels = _get_triton_kernels()
     if triton_kernels is not None and x.ndim >= 2:
@@ -903,6 +983,7 @@ if _COMFY_OPS_AVAILABLE:
         chunk_size = 0
         auto_convert_to_int8 = True
         debug_mode = False
+        quantization_mode = "auto"  # "auto", "tensorwise", "blockwise"
         
         class Linear(manual_cast.Linear):
             
@@ -1003,6 +1084,17 @@ if _COMFY_OPS_AVAILABLE:
                         print(f"[DEBUG] Loading {prefix.rstrip('.')}: dtype={weight_tensor.dtype}, scale={scale_info}")
                     
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
+                        # Validate quantization_mode vs model format
+                        mode = getattr(Int8TensorwiseOps, 'quantization_mode', 'auto')
+                        is_blockwise_model = isinstance(weight_scale, torch.Tensor) and weight_scale.ndim == 3
+                        
+                        if mode == 'tensorwise' and is_blockwise_model:
+                            print(f"[INT8 WARNING] Mode mismatch: quantization_mode='tensorwise' but model has blockwise scales (3D) for {prefix.rstrip('.')}")
+                            print(f"[INT8 WARNING] Either change mode to 'auto' or 'blockwise', or use a tensorwise-quantized model")
+                        elif mode == 'blockwise' and not is_blockwise_model:
+                            print(f"[INT8 WARNING] Mode mismatch: quantization_mode='blockwise' but model has tensorwise scales for {prefix.rstrip('.')}")
+                            print(f"[INT8 WARNING] Either change mode to 'auto' or 'tensorwise', or use a blockwise-quantized model")
+                        
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
                         is_hadamard_quip = hadamard_quip if isinstance(hadamard_quip, bool) else (hadamard_quip.item() if isinstance(hadamard_quip, torch.Tensor) else False)
                         
@@ -1269,8 +1361,11 @@ if _COMFY_OPS_AVAILABLE:
                                     if out.numel() > CHUNK_THRESHOLD_ELEMENTS and _should_clear_cache():
                                         torch.cuda.empty_cache()
                                 else:
-                                    d = dequantize(down, down_scale).to(device=out.device, dtype=out.dtype)
-                                    u = dequantize(up, up_scale).to(device=out.device, dtype=out.dtype)
+                                    # Detect block-wise scales (3D) for LoRA weights
+                                    is_down_blockwise = isinstance(down_scale, torch.Tensor) and down_scale.ndim == 3
+                                    is_up_blockwise = isinstance(up_scale, torch.Tensor) and up_scale.ndim == 3
+                                    d = dequantize(down, down_scale, use_blockwise=is_down_blockwise).to(device=out.device, dtype=out.dtype)
+                                    u = dequantize(up, up_scale, use_blockwise=is_up_blockwise).to(device=out.device, dtype=out.dtype)
                                     
                                     is_fp32 = (out.dtype == torch.float32)
                                     if is_fp32 and torch.cuda.is_available():
@@ -1539,8 +1634,11 @@ if _COMFY_OPS_AVAILABLE:
                                 if y.numel() > CHUNK_THRESHOLD_ELEMENTS and _should_clear_cache():
                                     torch.cuda.empty_cache()
                             else:
-                                d = dequantize(down, down_scale).to(device=y.device, dtype=y.dtype)
-                                u = dequantize(up, up_scale).to(device=y.device, dtype=y.dtype)
+                                # Detect block-wise scales (3D) for LoRA weights
+                                is_down_blockwise = isinstance(down_scale, torch.Tensor) and down_scale.ndim == 3
+                                is_up_blockwise = isinstance(up_scale, torch.Tensor) and up_scale.ndim == 3
+                                d = dequantize(down, down_scale, use_blockwise=is_down_blockwise).to(device=y.device, dtype=y.dtype)
+                                u = dequantize(up, up_scale, use_blockwise=is_up_blockwise).to(device=y.device, dtype=y.dtype)
                                 
                                 is_fp32 = (y.dtype == torch.float32)
                                 if is_fp32 and torch.cuda.is_available():

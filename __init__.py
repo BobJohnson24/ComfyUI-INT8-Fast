@@ -1,11 +1,13 @@
 """
-int8 - Fast INT8 Tensorwise Quantization for ComfyUI
+ComfyUI-Wan-INT8 - Fast INT8 Quantization for ComfyUI
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
 - WanVideoINT8Loader: Load int8 quantized diffusion models
+- Block-wise INT8 quantization support for improved accuracy
 
-Uses torch._int_mm for blazing fast inference.
+Uses torch._int_mm and Triton kernels for blazing fast inference.
+Supports both tensor-wise and block-wise quantization modes.
 """
 
 import torch
@@ -106,6 +108,16 @@ try:
         print_kernel_summary,
         reset_kernel_stats,
     )
+    
+    # Export block-wise kernel utilities for advanced users
+    try:
+        from .triton_kernels import (
+            triton_blockwise_int8_linear,
+            clear_weight_packing_cache,
+        )
+    except ImportError:
+        triton_blockwise_int8_linear = None
+        clear_weight_packing_cache = None
     
     _hadamard_status = "enabled" if is_hadamard_quip_enabled() else "disabled"
     print(f"[ComfyUI-Wan-INT8] Hadamard-QuIP kernel: {_hadamard_status}")

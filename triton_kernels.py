@@ -533,6 +533,14 @@ _FIXED_GROUP_SIZE_M = 8
 _FIXED_NUM_WARPS = 4
 _FIXED_NUM_STAGES = 4
 
+# Ampere-optimized blockwise configuration
+_AMPERE_BLOCKWISE_BLOCK_M = 128
+_AMPERE_BLOCKWISE_BLOCK_N = 128
+_AMPERE_BLOCKWISE_BLOCK_K = 64
+_AMPERE_BLOCKWISE_NUM_WARPS = 8
+_AMPERE_BLOCKWISE_NUM_STAGES = 4
+_AMPERE_BLOCKWISE_GROUP_M = 8
+
 @triton.jit
 def _int8_matmul_dequant_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -1397,6 +1405,789 @@ def test_kernel_accuracy(shapes=None, device="cuda", compute_dtype=torch.bfloat1
         del x, w, w_int8, w_scale
         del results['y_amp'], results['y_fbk'], results['y_ref']
         torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Block-wise INT8 Quantization Kernels
+# =============================================================================
+# These kernels perform INT8 matrix multiplication with block-wise scales.
+# Weights stay in INT8 during inference for ~4x memory savings vs BF16.
+# Block-wise scales have shape [N, num_blocks, 1] where num_blocks = K // block_size
+
+# Cache for packed weights to avoid re-packing on every forward pass
+_weight_packing_cache = {}
+_MAX_CACHE_ENTRIES = 8  # Limit cache size for low VRAM
+
+
+def _get_cache_key(weight, weight_scale):
+    """Generate cache key from weight tensor identity and shape."""
+    return (id(weight), weight.shape, weight_scale.shape if isinstance(weight_scale, torch.Tensor) else weight_scale)
+
+
+def clear_weight_packing_cache():
+    """Clear the weight packing cache. Call when running low on memory."""
+    global _weight_packing_cache
+    _weight_packing_cache.clear()
+    gc.collect()
+
+
+def pack_weight_for_blockwise(weight_nk: torch.Tensor) -> torch.Tensor:
+    """
+    Pack weight from [N, K] to [K, N] layout for coalesced access.
+    
+    Args:
+        weight_nk: INT8 weight tensor [N, K]
+    
+    Returns:
+        Packed weight [K, N] contiguous along N dimension
+    """
+    # Transpose and ensure contiguous
+    # This is a one-time cost per layer during model loading or first forward
+    weight_kn = weight_nk.t().contiguous()
+    return weight_kn
+
+
+def pack_scales_for_blockwise(scale_n_blocks: torch.Tensor) -> torch.Tensor:
+    """
+    Pack scales from [N, num_blocks] to [num_blocks, N] layout.
+    
+    Args:
+        scale_n_blocks: Block-wise scales [N, num_blocks] or [N, num_blocks, 1]
+    
+    Returns:
+        Packed scales [num_blocks, N] contiguous along N
+    """
+    # Remove trailing dim if present [N, num_blocks, 1] -> [N, num_blocks]
+    if scale_n_blocks.ndim == 3:
+        scale_n_blocks = scale_n_blocks.squeeze(-1)
+    
+    # Transpose to [num_blocks, N] and ensure contiguous
+    scale_blocks_n = scale_n_blocks.t().contiguous()
+    return scale_blocks_n
+
+
+def get_packed_weight_and_scales(weight: torch.Tensor, weight_scale: torch.Tensor,
+                                  use_cache: bool = True) -> tuple:
+    """
+    Get packed weight and scales for optimized blockwise matmul.
+    
+    For low VRAM:
+    - Uses caching to avoid re-packing
+    - Cache is LRU with limited entries
+    - Can be disabled if memory is critical
+    
+    Args:
+        weight: INT8 weight [N, K]
+        weight_scale: Block-wise scales [N, num_blocks, 1] or [N, num_blocks]
+        use_cache: Whether to cache packed tensors
+    
+    Returns:
+        Tuple of (packed_weight [K, N], packed_scales [num_blocks, N],
+                  num_blocks, block_size)
+    """
+    global _weight_packing_cache
+    
+    if use_cache:
+        cache_key = _get_cache_key(weight, weight_scale)
+        if cache_key in _weight_packing_cache:
+            return _weight_packing_cache[cache_key]
+    
+    # Get dimensions
+    N, K = weight.shape
+    
+    # Handle 3D scales [N, num_blocks, 1]
+    if weight_scale.ndim == 3:
+        num_blocks = weight_scale.shape[1]
+    else:
+        num_blocks = weight_scale.shape[1] if weight_scale.ndim >= 2 else 1
+    
+    block_size = K // num_blocks
+    
+    # Pack weight and scales
+    weight_packed = pack_weight_for_blockwise(weight)
+    scales_packed = pack_scales_for_blockwise(weight_scale)
+    
+    result = (weight_packed, scales_packed, num_blocks, block_size)
+    
+    if use_cache:
+        # Manage cache size for low VRAM
+        if len(_weight_packing_cache) >= _MAX_CACHE_ENTRIES:
+            # Remove oldest entry (simple FIFO)
+            oldest_key = next(iter(_weight_packing_cache))
+            del _weight_packing_cache[oldest_key]
+        
+        _weight_packing_cache[cache_key] = result
+    
+    return result
+
+
+def prepack_weights_for_inference(weight: torch.Tensor, weight_scale: torch.Tensor) -> tuple:
+    """
+    Pre-pack weights and scales during model loading to avoid first-call overhead.
+    
+    For low VRAM scenarios, call this during model loading so the transpose/contiguous
+    operations don't happen during the first forward pass.
+    
+    Args:
+        weight: INT8 weight [N, K] in original layout
+        weight_scale: Block-wise scales [N, num_blocks, 1] or [N, num_blocks]
+    
+    Returns:
+        Tuple of (packed_weight [K, N], packed_scales [num_blocks, N])
+        Store these and pass them to the kernel directly for best performance.
+    
+    Example:
+        # During model loading
+        weight_packed, scales_packed = prepack_weights_for_inference(weight, scale)
+        layer.weight = nn.Parameter(weight_packed, requires_grad=False)
+        layer.register_buffer('weight_scale_packed', scales_packed)
+    """
+    weight_packed = pack_weight_for_blockwise(weight)
+    scales_packed = pack_scales_for_blockwise(weight_scale)
+    return weight_packed, scales_packed
+
+
+@triton.jit
+def _blockwise_int8_matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    a_scale_ptr, b_scale_ptr, bias_ptr,
+    M, N, K, num_blocks, block_size,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    stride_scale_n, stride_scale_b,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """
+    Computes: C = sum over K blocks of ((A * B) * (scale_a * scale_b_block))
+    A: [M, K] int8 (activations)
+    B: [N, K] int8 (weights, transposed access via strides)
+    b_scale: [N, num_blocks] float32 (block-wise scales)
+    a_scale: [M, 1] float32 (per-token activation scales)
+    
+    Fixed version: Properly accumulates INT32 results within each scale block
+    before dequantization to avoid precision loss from partial dequantization.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    # Initialize FP32 accumulator for final output
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Load activation scales for this tile [BLOCK_M]
+    scale_a = tl.load(a_scale_ptr + offs_am)
+    
+    # Calculate how many BLOCK_K tiles fit in one scale block
+    # This determines how many K tiles share the same scale
+    tiles_per_scale_block = block_size // BLOCK_K
+    
+    # Calculate tiles per scale block (compile-time constant when possible)
+    tiles_per_scale_block = block_size // BLOCK_K
+    
+    # Iterate through scale blocks first (outer loop)
+    for block_idx in range(0, num_blocks):
+        # Initialize INT32 accumulator for this scale block
+        # We accumulate INT32 results within each scale block before dequantizing
+        block_accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        
+        # Compute starting K offset for this scale block
+        block_k_start = block_idx * block_size
+        
+        # Inner loop: accumulate INT32 matmul within this scale block
+        for tile_idx in range(0, tiles_per_scale_block):
+            k_offset = block_k_start + tile_idx * BLOCK_K
+            
+            # Create masks for valid K elements
+            # When k_offset >= K, all masks will be False and loads will return 0
+            k_mask_a = offs_k[None, :] < K - k_offset
+            k_mask_b = offs_k[:, None] < K - k_offset
+            
+            # Update pointers for this K tile
+            a_tile_ptrs = a_ptr + (offs_am[:, None] * stride_am +
+                                   (offs_k[None, :] + k_offset) * stride_ak)
+            b_tile_ptrs = b_ptr + ((offs_k[:, None] + k_offset) * stride_bk +
+                                   offs_bn[None, :] * stride_bn)
+            
+            a = tl.load(a_tile_ptrs, mask=k_mask_a, other=0)
+            b = tl.load(b_tile_ptrs, mask=k_mask_b, other=0)
+            
+            # Accumulate INT32 matmul result
+            block_accumulator += tl.dot(a, b)
+        
+        # Load block-wise scale for this block [BLOCK_N]
+        scale_b = tl.load(b_scale_ptr + offs_bn * stride_scale_n + block_idx * stride_scale_b)
+        
+        # Dequantize once per scale block: int32 -> fp32, apply scales
+        block_result = block_accumulator.to(tl.float32)
+        total_scale = scale_a[:, None] * scale_b[None, :]
+        block_result = block_result * total_scale
+        
+        # Accumulate to output
+        accumulator += block_result
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_bn)
+        accumulator = accumulator + bias[None, :]
+
+    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+    c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+    
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
+def _blockwise_int8_matmul_optimized_kernel(
+    a_ptr,                    # [M, K] int8 activations
+    b_packed_ptr,             # [K, N] int8 weights (pre-packed, contiguous along N)
+    c_ptr,                    # [M, N] output
+    a_scale_ptr,              # [M] float32 per-token activation scales
+    b_scale_packed_ptr,       # [num_blocks, N] float32 block-wise scales (pre-transposed)
+    bias_ptr,                 # [N] optional bias
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,     # stride_bn should be 1 for packed layout
+    stride_cm, stride_cn,
+    stride_scale_blk, stride_scale_n,  # stride_scale_n should be 1 for packed layout
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,      # Compile-time constant: num_blocks
+    BLOCK_SIZE: tl.constexpr,      # Compile-time constant: K // num_blocks
+    TILES_PER_BLOCK: tl.constexpr, # Compile-time constant: block_size // BLOCK_K
+    HAS_BIAS: tl.constexpr,
+    EVEN_K: tl.constexpr,      # True if K % BLOCK_K == 0
+    EVEN_M: tl.constexpr,      # True if M % BLOCK_M == 0
+    EVEN_N: tl.constexpr,      # True if N % BLOCK_N == 0
+):
+    """
+    Optimized block-wise INT8 matmul with pre-packed layouts.
+    
+    Memory Layouts (pre-packed for coalescing):
+    - B: [K, N] contiguous along N (was [N, K] originally)
+    - Scales: [num_blocks, N] contiguous along N (was [N, num_blocks] originally)
+    
+    Loop Structure:
+    - Outer loop over scale blocks (num_blocks)
+    - Inner loop over tiles within each block (tiles_per_block)
+    - Accumulate int32 within block, dequantize once per block
+    
+    Grid: 2D (pid_m, pid_n) for simpler indexing
+    
+    Fixed version: Properly handles partial tiles at K boundary to avoid
+    including garbage values in accumulation.
+    """
+    # 2D launch grid - simpler than grouped 1D
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Compute offsets with proper bounds checking (no modulo wraparound)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Create masks for valid elements
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    # Alignment hints for better vectorization
+    # These tell Triton that indices are multiples of certain values
+    tl.multiple_of(offs_n, 8)
+    tl.max_contiguous(offs_n, BLOCK_N)
+
+    # Load activation scales once [BLOCK_M] with mask
+    scale_a = tl.load(a_scale_ptr + offs_m, mask=mask_m, other=0.0)
+    
+    # Initialize output accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Outer loop over scale blocks
+    # Using static_range when NUM_BLOCKS is constexpr allows unrolling
+    for blk in tl.static_range(0, NUM_BLOCKS):
+        # Accumulate int32 within this scale block
+        acc_int32 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        
+        # Compute K offset for this block
+        block_k_start = blk * BLOCK_SIZE
+        
+        # Inner loop over tiles within this block
+        # Using static_range when TILES_PER_BLOCK is constexpr
+        for t in tl.static_range(0, TILES_PER_BLOCK):
+            k_offset = block_k_start + t * BLOCK_K
+            
+            offs_kt = tl.arange(0, BLOCK_K)
+            k_ids = k_offset + offs_kt
+            
+            # Create K mask - critical for correctness when K boundary is within this tile
+            # When k_offset >= K, all elements are masked out (loads return 0)
+            if EVEN_K:
+                mask_k = k_ids < K
+            else:
+                mask_k = k_ids < K
+            
+            # Load activation tile [BLOCK_M, BLOCK_K]
+            a_ptrs = a_ptr + (offs_m[:, None] * stride_am +
+                              k_ids[None, :] * stride_ak)
+            a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0)
+            
+            # Load weight tile [BLOCK_K, BLOCK_N] from packed layout
+            # B is [K, N] with stride_bn=1, so loads are contiguous along N
+            b_ptrs = b_packed_ptr + (k_ids[:, None] * stride_bk +
+                                      offs_n[None, :] * stride_bn)
+            b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0)
+            
+            # INT8 matmul accumulation
+            acc_int32 += tl.dot(a, b)
+        
+        # Load block-wise scale for this block [BLOCK_N]
+        # Scales are [num_blocks, N] with stride_scale_n=1, so loads are contiguous
+        scale_b = tl.load(b_scale_packed_ptr + blk * stride_scale_blk + offs_n,
+                          mask=mask_n, other=0.0)
+        
+        # Dequantize once per block: int32 -> fp32, apply scales
+        block_result = acc_int32.to(tl.float32)
+        total_scale = scale_a[:, None] * scale_b[None, :]
+        block_result = block_result * total_scale
+        
+        # Accumulate to output
+        accumulator += block_result
+    
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        accumulator = accumulator + bias[None, :]
+
+    # Store output with proper masking
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    if EVEN_M and EVEN_N:
+        tl.store(c_ptrs, accumulator)
+    else:
+        tl.store(c_ptrs, accumulator, mask=mask_m[:, None] & mask_n[None, :])
+
+
+@triton.jit
+def _blockwise_int8_matmul_ampere(
+    a_ptr,                    # [M, K] int8 activations
+    b_packed_ptr,             # [K, N] int8 weights (pre-packed, contiguous along N)
+    c_ptr,                    # [M, N] output
+    a_scale_ptr,              # [M] float32 per-token activation scales
+    b_scale_packed_ptr,       # [num_blocks, N] float32 block-wise scales (pre-transposed)
+    bias_ptr,                 # [N] optional bias
+    M, N, K,
+    num_blocks,               # Number of scale blocks (runtime value)
+    block_size,               # Size of each scale block (K // num_blocks)
+    stride_am, stride_ak,
+    stride_bk, stride_bn,     # stride_bn should be 1 for packed layout
+    stride_cm, stride_cn,
+    stride_scale_blk, stride_scale_n,  # stride_scale_n should be 1 for packed layout
+    HAS_BIAS: tl.constexpr = False,
+    BM: tl.constexpr = _AMPERE_BLOCKWISE_BLOCK_M,
+    BN: tl.constexpr = _AMPERE_BLOCKWISE_BLOCK_N,
+    BK: tl.constexpr = _AMPERE_BLOCKWISE_BLOCK_K,
+    GROUP_M: tl.constexpr = _AMPERE_BLOCKWISE_GROUP_M,
+):
+    """
+    Ampere-optimized block-wise INT8 matmul with pipelined loads.
+    
+    Memory Layouts (pre-packed for coalescing):
+    - A: [M, K] row-major
+    - B: [K, N] contiguous along N (packed from [N, K])
+    - Scales: [num_blocks, N] contiguous along N (packed from [N, num_blocks])
+    
+    Uses tl.make_block_ptr for pipelined memory access on Ampere (SM80/86).
+    Grid: 1D with grouped swizzling for L2 cache optimization.
+    """
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BM)
+    grid_n = tl.cdiv(N, BN)
+    
+    # Swizzled grouping for better L2 cache utilization (same as tensorwise Ampere kernel)
+    num_pid_in_group = GROUP_M * grid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(grid_m - first_pid_m, GROUP_M)
+    
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    
+    # Create masks
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    # Load activation scales once [BM]
+    scale_a = tl.load(a_scale_ptr + offs_m, mask=mask_m, other=1.0).to(tl.float32)
+    
+    # Initialize FP32 accumulator
+    accumulator = tl.zeros((BM, BN), dtype=tl.float32)
+    
+    # Calculate tiles per scale block
+    tiles_per_scale_block = block_size // BK
+    
+    # Outer loop over scale blocks
+    for block_idx in range(0, num_blocks):
+        # INT32 accumulator for this scale block
+        block_acc = tl.zeros((BM, BN), dtype=tl.int32)
+        
+        # Starting K offset for this scale block
+        block_k_start = block_idx * block_size
+        
+        # Use block pointers for pipelined loads within this scale block
+        # A block pointer for [BM, BK] tiles
+        A_block_ptr = tl.make_block_ptr(
+            base=a_ptr, shape=(M, K), strides=(stride_am, stride_ak),
+            offsets=(pid_m * BM, block_k_start), block_shape=(BM, BK), order=(1, 0),
+        )
+        # B block pointer for [BK, BN] tiles (B is [K, N] packed)
+        B_block_ptr = tl.make_block_ptr(
+            base=b_packed_ptr, shape=(K, N), strides=(stride_bk, stride_bn),
+            offsets=(block_k_start, pid_n * BN), block_shape=(BK, BN), order=(0, 1),
+        )
+        
+        # Inner loop over tiles within this scale block
+        for _ in range(0, tiles_per_scale_block):
+            # Load A and B tiles with pipelining
+            a = tl.load(A_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.int8)
+            b = tl.load(B_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.int8)
+            
+            # INT8 matmul accumulation
+            block_acc += tl.dot(a, b)
+            
+            # Advance block pointers
+            A_block_ptr = tl.advance(A_block_ptr, (0, BK))
+            B_block_ptr = tl.advance(B_block_ptr, (BK, 0))
+        
+        # Load block-wise scale for this block [BN]
+        scale_b = tl.load(
+            b_scale_packed_ptr + block_idx * stride_scale_blk + offs_n,
+            mask=mask_n, other=1.0
+        ).to(tl.float32)
+        
+        # Dequantize once per block
+        block_result = block_acc.to(tl.float32)
+        total_scale = scale_a[:, None] * scale_b[None, :]
+        block_result = block_result * total_scale
+        
+        # Accumulate to output
+        accumulator += block_result
+    
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        accumulator = accumulator + bias[None, :]
+    
+    # Store output
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, accumulator, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def triton_blockwise_int8_linear(
+    x: torch.Tensor,           # [*, K] activations
+    weight: torch.Tensor,      # [N, K] INT8 weights
+    weight_scale: torch.Tensor, # [N, num_blocks, 1] block-wise scales
+    bias: torch.Tensor = None,
+    compute_dtype: torch.dtype = torch.float16,
+    use_optimized: bool = False,  # Use optimized kernel with pre-packed layouts (default False for stability)
+) -> torch.Tensor:
+    """
+    Block-wise INT8 linear layer with on-the-fly dequantization.
+    
+    Keeps weights in INT8 during inference for ~4x memory savings vs BF16.
+    Block-wise scales are applied per K-block during the matmul.
+    
+    Args:
+        x: Input activations [*, K] (float16/bfloat16/float32)
+        weight: INT8 weights [N, K]
+        weight_scale: Block-wise scales [N, num_blocks, 1]
+        bias: Optional bias [N]
+        compute_dtype: Output dtype
+        use_optimized: Whether to use the optimized kernel with pre-packed layouts
+    
+    Returns:
+        Output tensor [*, N] in compute_dtype
+    """
+    import os
+    import sys
+    _BLOCKWISE_DEBUG = os.environ.get("INT8_DEBUG_MODE", "0") == "1"
+    _DIAG = os.environ.get("INT8_DEBUG_DIAG", "0") == "1"
+    
+    if _DIAG or _BLOCKWISE_DEBUG:
+        print(f"[BLOCKWISE] ENTRY: x.shape={x.shape}, weight.shape={weight.shape}, weight_scale.shape={weight_scale.shape}", flush=True)
+        sys.stdout.flush()
+    
+    x_shape_orig = x.shape
+    x_2d = x.reshape(-1, x_shape_orig[-1])
+    
+    M, K = x_2d.shape
+    N = weight.shape[0]
+    
+    if _BLOCKWISE_DEBUG:
+        print(f"[BLOCKWISE] Input: M={M}, K={K}, N={N}, weight_scale_shape={weight_scale.shape}")
+    
+    # Quantize activations to INT8 with per-token scales
+    x_int8, x_scale = triton_quantize_rowwise(x_2d)
+
+    # Prepare output buffer
+    output = torch.empty((M, N), device=x.device, dtype=compute_dtype)
+    
+    if _BLOCKWISE_DEBUG:
+        print(f"[BLOCKWISE] x_int8_shape={x_int8.shape}, x_scale_shape={x_scale.shape}")
+    
+    if use_optimized:
+        # Use optimized kernel with pre-packed layouts
+        try:
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Using optimized kernel path")
+            
+            # Get packed weight and scales (cached for efficiency)
+            weight_packed, scales_packed, num_blocks, block_size = \
+                get_packed_weight_and_scales(weight, weight_scale, use_cache=True)
+            
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Packed: num_blocks={num_blocks}, block_size={block_size}")
+            
+            # Calculate tiles per block for constexpr
+            # For correctness, block_size must be evenly divisible by BLOCK_K
+            if block_size < _FIXED_BLOCK_K or block_size % _FIXED_BLOCK_K != 0:
+                reason = "< BLOCK_K" if block_size < _FIXED_BLOCK_K else "not divisible by BLOCK_K"
+                raise ValueError(
+                    f"block_size ({block_size}) {reason} ({_FIXED_BLOCK_K}). "
+                    f"Optimized kernel requires block_size to be >= BLOCK_K and evenly divisible. "
+                    f"Falling back to original kernel."
+                )
+            
+            tiles_per_block = block_size // _FIXED_BLOCK_K
+            
+            # Check if dimensions are evenly divisible (for mask optimization)
+            even_m = (M % _FIXED_BLOCK_M) == 0
+            even_n = (N % _FIXED_BLOCK_N) == 0
+            even_k = (K % _FIXED_BLOCK_K) == 0
+            
+            # Use 2D grid for simpler indexing
+            grid = (triton.cdiv(M, _FIXED_BLOCK_M), triton.cdiv(N, _FIXED_BLOCK_N))
+            
+            has_bias = bias is not None
+            bias_ptr = bias if has_bias else x_int8
+            
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Launching optimized kernel: grid={grid}, tiles_per_block={tiles_per_block}")
+                torch.cuda.synchronize()
+            
+            # Launch optimized kernel with 2D grid
+            # Note: NUM_BLOCKS, BLOCK_SIZE, TILES_PER_BLOCK are constexpr for unrolling
+            _blockwise_int8_matmul_optimized_kernel[grid](
+                a_ptr=x_int8,
+                b_packed_ptr=weight_packed,
+                c_ptr=output,
+                a_scale_ptr=x_scale,
+                b_scale_packed_ptr=scales_packed,
+                bias_ptr=bias_ptr,
+                M=M, N=N, K=K,
+                stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
+                stride_bk=weight_packed.stride(0), stride_bn=weight_packed.stride(1),
+                stride_cm=output.stride(0), stride_cn=output.stride(1),
+                stride_scale_blk=scales_packed.stride(0), stride_scale_n=scales_packed.stride(1),
+                BLOCK_M=_FIXED_BLOCK_M,
+                BLOCK_N=_FIXED_BLOCK_N,
+                BLOCK_K=_FIXED_BLOCK_K,
+                NUM_BLOCKS=num_blocks,
+                BLOCK_SIZE=block_size,
+                TILES_PER_BLOCK=tiles_per_block,
+                HAS_BIAS=has_bias,
+                EVEN_K=even_k,
+                EVEN_M=even_m,
+                EVEN_N=even_n,
+                num_warps=_FIXED_NUM_WARPS,
+                num_stages=_FIXED_NUM_STAGES,
+            )
+            
+            if _BLOCKWISE_DEBUG:
+                torch.cuda.synchronize()
+                print(f"[BLOCKWISE] Optimized kernel completed successfully")
+            
+            return output.reshape(x_shape_orig[:-1] + (N,))
+            
+        except Exception as e:
+            # Fallback to original kernel if optimized fails
+            # This can happen if shapes don't align or for edge cases
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Optimized kernel failed: {e}, falling back to original kernel")
+            use_optimized = False
+    
+    if not use_optimized:
+        # Get block-wise parameters from scale tensor
+        num_blocks = weight_scale.shape[1]
+        block_size = K // num_blocks
+        
+        # Check if we can use the Ampere-optimized kernel (includes Ada)
+        gpu_arch = gpu_family()
+        is_ampere_or_newer = gpu_arch in ("ampere", "ada")
+        can_use_ampere = (is_ampere_or_newer and
+                         block_size >= _AMPERE_BLOCKWISE_BLOCK_K and
+                         block_size % _AMPERE_BLOCKWISE_BLOCK_K == 0)
+        
+        if can_use_ampere:
+            # Use Ampere-optimized kernel with pre-packed layouts
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Using Ampere-optimized kernel path")
+            
+            try:
+                # Pack weight from [N, K] to [K, N] for optimal access
+                if weight.stride(0) != weight.shape[1] or weight.stride(1) != 1:
+                    weight_packed = weight.t().contiguous()
+                else:
+                    weight_packed = weight.t()
+                
+                # Pack scales from [N, num_blocks] to [num_blocks, N]
+                w_scale_2d = weight_scale.squeeze(-1)
+                if w_scale_2d.stride(0) != 1:
+                    scales_packed = w_scale_2d.t().contiguous()
+                else:
+                    scales_packed = w_scale_2d.t()
+                
+                # Grid with grouped swizzling (same as tensorwise Ampere kernel)
+                grid = (triton.cdiv(M, _AMPERE_BLOCKWISE_BLOCK_M) * triton.cdiv(N, _AMPERE_BLOCKWISE_BLOCK_N),)
+                
+                has_bias = bias is not None
+                bias_ptr = bias if has_bias else x_int8
+                
+                if _DIAG or _BLOCKWISE_DEBUG:
+                    print(f"[BLOCKWISE] Launching Ampere kernel: grid={grid}, num_blocks={num_blocks}, block_size={block_size}", flush=True)
+                    sys.stdout.flush()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                
+                import time as _time
+                _kernel_start = _time.perf_counter()
+                
+                _blockwise_int8_matmul_ampere[grid](
+                    a_ptr=x_int8,
+                    b_packed_ptr=weight_packed,
+                    c_ptr=output,
+                    a_scale_ptr=x_scale,
+                    b_scale_packed_ptr=scales_packed,
+                    bias_ptr=bias_ptr,
+                    M=M, N=N, K=K,
+                    num_blocks=num_blocks,
+                    block_size=block_size,
+                    stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
+                    stride_bk=weight_packed.stride(0), stride_bn=weight_packed.stride(1),
+                    stride_cm=output.stride(0), stride_cn=output.stride(1),
+                    stride_scale_blk=scales_packed.stride(0), stride_scale_n=scales_packed.stride(1),
+                    HAS_BIAS=has_bias,
+                    num_warps=_AMPERE_BLOCKWISE_NUM_WARPS,
+                    num_stages=_AMPERE_BLOCKWISE_NUM_STAGES,
+                )
+                
+                if _DIAG or _BLOCKWISE_DEBUG:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _kernel_elapsed = _time.perf_counter() - _kernel_start
+                    print(f"[BLOCKWISE] Ampere kernel execution completed in {_kernel_elapsed*1000:.2f}ms", flush=True)
+                    sys.stdout.flush()
+                
+            except Exception as e:
+                if _BLOCKWISE_DEBUG:
+                    print(f"[BLOCKWISE] Ampere kernel failed: {e}, falling back to original kernel")
+                can_use_ampere = False
+        
+        if not can_use_ampere:
+            # Fallback to original kernel
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Using original (non-optimized) kernel path")
+            
+            if _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Original kernel: num_blocks={num_blocks}, block_size={block_size}")
+            
+            # Validate: block_size must be >= BLOCK_K and divisible by BLOCK_K
+            if block_size < _FIXED_BLOCK_K:
+                raise ValueError(
+                    f"block_size ({block_size}) < BLOCK_K ({_FIXED_BLOCK_K}). "
+                    f"Blockwise kernels require block_size >= BLOCK_K. "
+                    f"Consider using fewer blocks (num_blocks <= {K // _FIXED_BLOCK_K})."
+                )
+            
+            if block_size % _FIXED_BLOCK_K != 0:
+                raise ValueError(
+                    f"block_size ({block_size}) must be divisible by BLOCK_K ({_FIXED_BLOCK_K}). "
+                    f"Consider using a block count where {K} // num_blocks is divisible by {_FIXED_BLOCK_K}. "
+                    f"Valid num_blocks for K={K}: {[b for b in range(1, K+1) if K % b == 0 and (K // b) % _FIXED_BLOCK_K == 0][:10]}..."
+                )
+            
+            # Prepare scale tensor: [N, num_blocks, 1] -> [N, num_blocks]
+            w_scale_2d = weight_scale.squeeze(-1).contiguous()
+
+            # Launch kernel
+            grid = (triton.cdiv(M, _FIXED_BLOCK_M) * triton.cdiv(N, _FIXED_BLOCK_N), )
+            
+            has_bias = bias is not None
+            bias_ptr = bias if has_bias else x_int8
+            
+            if _DIAG or _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] Launching original kernel: grid={grid}, num_blocks={num_blocks}, block_size={block_size}", flush=True)
+                sys.stdout.flush()
+            
+            if _DIAG or _BLOCKWISE_DEBUG:
+                print(f"[BLOCKWISE] About to compile/launch Triton kernel...", flush=True)
+                sys.stdout.flush()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            
+            import time as _time
+            _kernel_start = _time.perf_counter()
+            
+            _blockwise_int8_matmul_kernel[grid](
+                a_ptr=x_int8,
+                b_ptr=weight,
+                c_ptr=output,
+                a_scale_ptr=x_scale,
+                b_scale_ptr=w_scale_2d,
+                bias_ptr=bias_ptr,
+                M=M, N=N, K=K,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
+                stride_bk=weight.stride(1), stride_bn=weight.stride(0),
+                stride_cm=output.stride(0), stride_cn=output.stride(1),
+                stride_scale_n=w_scale_2d.stride(0), stride_scale_b=w_scale_2d.stride(1),
+                BLOCK_M=_FIXED_BLOCK_M,
+                BLOCK_N=_FIXED_BLOCK_N,
+                BLOCK_K=_FIXED_BLOCK_K,
+                GROUP_SIZE_M=_FIXED_GROUP_SIZE_M,
+                HAS_BIAS=has_bias,
+                num_warps=_FIXED_NUM_WARPS,
+                num_stages=_FIXED_NUM_STAGES,
+            )
+            
+            if _DIAG or _BLOCKWISE_DEBUG:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _kernel_elapsed = _time.perf_counter() - _kernel_start
+                print(f"[BLOCKWISE] Kernel execution completed in {_kernel_elapsed*1000:.2f}ms", flush=True)
+                sys.stdout.flush()
+    
+    if _DIAG or _BLOCKWISE_DEBUG:
+        print(f"[BLOCKWISE] RETURN: output.shape={output.shape}", flush=True)
+        sys.stdout.flush()
+    
+    return output.reshape(x_shape_orig[:-1] + (N,))
 
 
 if __name__ == "__main__":
