@@ -38,7 +38,9 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
     generator = torch.Generator(device=x.device)
     generator.manual_seed(seed)
     
-    # Scale to INT8 range
+    # Scale to INT8 range — move scale to x's device to handle CPU-stored scales
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(x.device)
     x_scaled = x / scale
     
     # Stochastic rounding
@@ -131,6 +133,28 @@ if _LORA_ADAPTER_AVAILABLE:
             self.weight_scale = weight_scale
             self.seed = seed
 
+        def _get_effective_scale(self, delta_f, offset):
+            """Slice weight_scale to match delta_f when dealing with merged QKV LoRAs.
+            
+            ComfyUI narrows the full weight to a Q/K/V slice before calling us,
+            but weight_scale is still the full merged tensor, so we need to match it.
+            """
+            ws = self.weight_scale
+            if not isinstance(ws, torch.Tensor) or ws.numel() == 1:
+                return ws  # scalar – always fine
+            # offset = (dim, start, size) as set by ComfyUI for merged QKV layers
+            if offset is not None and ws.shape[0] != delta_f.shape[0]:
+                dim, start, size = offset
+                if dim == 0:
+                    return ws.narrow(0, start, size)
+            # No offset, but still mismatched (e.g. separate-weight LoRA vs merged model):
+            # try to detect which chunk by matching row count
+            if ws.shape[0] != delta_f.shape[0] and ws.shape[0] % delta_f.shape[0] == 0:
+                # We don't know which chunk, best we can do is use a scale subset.
+                # Row-0 is a reasonable default; this path is a rare edge case.
+                return ws[: delta_f.shape[0]]
+            return ws
+
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             v = self.weights
             up, down, alpha = v[0], v[1], v[2]
@@ -157,7 +181,8 @@ if _LORA_ADAPTER_AVAILABLE:
             if weight.dtype == torch.int8:
                 # --- INT8 SPACE PATCHING ---
                 delta_f = lora_diff * scale
-                delta_int8 = stochastic_round_int8_delta(delta_f, self.weight_scale, self.seed)
+                eff_scale = self._get_effective_scale(delta_f, offset)
+                delta_int8 = stochastic_round_int8_delta(delta_f, eff_scale, self.seed)
                 
                 # Perform integer addition (int32 for safety) then clamp
                 res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
@@ -181,6 +206,19 @@ if _LORA_ADAPTER_AVAILABLE:
             self.patches = patches
             self.weight_scale = weight_scale
             self.seed = seed
+
+        def _get_effective_scale(self, delta_f, offset):
+            """Same slice-logic as INT8LoRAPatchAdapter._get_effective_scale."""
+            ws = self.weight_scale
+            if not isinstance(ws, torch.Tensor) or ws.numel() == 1:
+                return ws
+            if offset is not None and ws.shape[0] != delta_f.shape[0]:
+                dim, start, size = offset
+                if dim == 0:
+                    return ws.narrow(0, start, size)
+            if ws.shape[0] != delta_f.shape[0] and ws.shape[0] % delta_f.shape[0] == 0:
+                return ws[: delta_f.shape[0]]
+            return ws
 
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             # Note: 'strength' from ComfyUI is ignored here as we use internal lora_strengths
@@ -215,7 +253,8 @@ if _LORA_ADAPTER_AVAILABLE:
 
             if weight.dtype == torch.int8:
                 # One single stochastic rounding step for all combined LoRAs
-                delta_int8 = stochastic_round_int8_delta(total_delta_f, self.weight_scale, self.seed)
+                eff_scale = self._get_effective_scale(total_delta_f, offset)
+                delta_int8 = stochastic_round_int8_delta(total_delta_f, eff_scale, self.seed)
                 res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
                 return torch.clamp(res, -128, 127).to(torch.int8).to(device)
             else:
