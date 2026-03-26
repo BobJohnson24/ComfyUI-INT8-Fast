@@ -72,7 +72,7 @@ class INT8LoraLoader:
                 
                 # If module is quantized, upgrade the adapter to our high-precision version
                 if hasattr(target_module, '_is_quantized') and target_module._is_quantized:
-                    w_scale = target_module.weight_scale
+                    w_scale = target_module._get_weight_scale()
                     if isinstance(w_scale, torch.Tensor):
                         w_scale = w_scale.item() if w_scale.numel() == 1 else w_scale
                     
@@ -176,7 +176,7 @@ class INT8LoraLoaderStack:
                 is_quantized = hasattr(target_module, '_is_quantized') and target_module._is_quantized
                 
                 if is_quantized:
-                    w_scale = target_module.weight_scale
+                    w_scale = target_module._get_weight_scale()
                     if isinstance(w_scale, torch.Tensor):
                         w_scale = w_scale.item() if w_scale.numel() == 1 else w_scale
                     applied_count += 1

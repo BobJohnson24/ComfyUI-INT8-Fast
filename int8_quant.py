@@ -156,6 +156,9 @@ if _LORA_ADAPTER_AVAILABLE:
             return ws
 
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
+            if intermediate_dtype == torch.int8:
+                intermediate_dtype = torch.float32
+                
             v = self.weights
             up, down, alpha = v[0], v[1], v[2]
             
@@ -221,6 +224,9 @@ if _LORA_ADAPTER_AVAILABLE:
             return ws
 
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
+            if intermediate_dtype == torch.int8:
+                intermediate_dtype = torch.float32
+                
             # Note: 'strength' from ComfyUI is ignored here as we use internal lora_strengths
             device = weight.device
             comp_device = torch.device("cuda") if torch.cuda.is_available() else device
@@ -383,9 +389,10 @@ if _COMFY_OPS_AVAILABLE:
         class Linear(manual_cast.Linear):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self.weight_scale = None
+                self.register_buffer('weight_scale', None)
                 self._is_quantized = False
                 self._is_per_row = False  # Track quantization granularity
+                self._weight_scale_scalar = None  # For scalar (non-tensor) scales
                 self.compute_dtype = torch.bfloat16
                 self.lora_A = None
                 self.lora_B = None
@@ -416,16 +423,21 @@ if _COMFY_OPS_AVAILABLE:
                         
                         if isinstance(weight_scale, torch.Tensor):
                             if weight_scale.numel() == 1:
-                                self.weight_scale = weight_scale.float().item()
+                                # Scalar scale — store as float for speed
+                                self._weight_scale_scalar = weight_scale.float().item()
+                                self.weight_scale = None
                                 self._is_per_row = False
                             elif weight_scale.dim() == 2 and weight_scale.shape[1] == 1:
-                                self.weight_scale = weight_scale.float()
+                                self.register_buffer('weight_scale', weight_scale.float())
+                                self._weight_scale_scalar = None
                                 self._is_per_row = True
                             else:
-                                self.weight_scale = weight_scale.float()
+                                self.register_buffer('weight_scale', weight_scale.float())
+                                self._weight_scale_scalar = None
                                 self._is_per_row = False
                         else:
-                            self.weight_scale = float(weight_scale)
+                            self._weight_scale_scalar = float(weight_scale)
+                            self.weight_scale = None
                             self._is_per_row = False
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
@@ -443,7 +455,12 @@ if _COMFY_OPS_AVAILABLE:
                             q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
                             
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
-                            self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
+                            if isinstance(q_scale, torch.Tensor):
+                                self.register_buffer('weight_scale', q_scale.cpu())
+                                self._weight_scale_scalar = None
+                            else:
+                                self._weight_scale_scalar = float(q_scale)
+                                self.weight_scale = None
                             self._is_quantized = True
                             self._is_per_row = False
                     else:
@@ -457,6 +474,24 @@ if _COMFY_OPS_AVAILABLE:
                     self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                 else:
                     self.bias = None
+
+                # Update archived model dtypes so VBAR geometry uses the correct
+                # sizes. archive_model_dtypes runs before state_dict loading, so
+                # weight_comfy_model_dtype is stale (e.g. bfloat16 instead of int8).
+                # Without this, VBAR allocates 2x the needed memory and the cast
+                # buffer path misinterprets int8 data as bfloat16.
+                if self.weight is not None:
+                    self.weight_comfy_model_dtype = self.weight.dtype
+                if self.weight_scale is not None:
+                    self.weight_scale_comfy_model_dtype = self.weight_scale.dtype
+                if self.bias is not None:
+                    self.bias_comfy_model_dtype = self.bias.dtype
+
+            def _get_weight_scale(self):
+                """Get weight scale, preferring scalar if available."""
+                if self._weight_scale_scalar is not None:
+                    return self._weight_scale_scalar
+                return self.weight_scale
 
             def convert_weight(self, _weight, inplace=False):
                 if not self._is_quantized:
@@ -487,7 +522,7 @@ if _COMFY_OPS_AVAILABLE:
 
                 # Re-quantize if fallback occurred
                 from .int8_quant import stochastic_round_int8_delta
-                new_weight = stochastic_round_int8_delta(out_weight, self.weight_scale, seed)
+                new_weight = stochastic_round_int8_delta(out_weight, self._get_weight_scale(), seed)
                 
                 if return_weight:
                     return new_weight
@@ -513,18 +548,34 @@ if _COMFY_OPS_AVAILABLE:
             def forward(self, x: Tensor) -> Tensor:
                 """Fast forward using torch._int_mm for quantized weights."""
                 
+                # Check if ComfyUI needs to manage weight transfer (VBAR, offloading, LoRA patches, etc.)
+                # This mirrors the base class check in disable_weight_init.Linear.forward()
+                need_cast = self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0
+                
                 if not self._is_quantized:
-                    weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
-                    out = F.linear(x, weight, bias)
-                    uncast_bias_weight(self, weight, bias, offload_stream)
-                    return out
+                    if need_cast:
+                        weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
+                        out = F.linear(x, weight, bias)
+                        uncast_bias_weight(self, weight, bias, offload_stream)
+                        return out
+                    else:
+                        return F.linear(x, self.weight, self.bias)
                 
-                # 1. Move weight/bias/scale to device (non_blocking)
-                weight = self.weight.to(x.device, non_blocking=True)
-                bias = self.bias.to(x.device, non_blocking=True) if self.bias is not None else None
+                # INT8 quantized path
+                if need_cast:
+                    # VBAR / offload / lowvram path
+                    weight, bias, offload_stream = cast_bias_weight(
+                        self, input=None, dtype=torch.int8, device=x.device,
+                        bias_dtype=x.dtype, offloadable=True
+                    )
+                else:
+                    # Fast path: weights already on GPU, no functions to apply
+                    weight = self.weight
+                    bias = self.bias
+                    offload_stream = None
                 
-                w_scale = self.weight_scale
-                if isinstance(w_scale, torch.Tensor):
+                w_scale = self._get_weight_scale()
+                if isinstance(w_scale, torch.Tensor) and w_scale.device != x.device:
                     w_scale = w_scale.to(x.device, non_blocking=True)
                 
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
@@ -557,6 +608,8 @@ if _COMFY_OPS_AVAILABLE:
                     
                     y = y + lora_y.to(y.dtype)
                 
+                if need_cast:
+                    uncast_bias_weight(self, weight, bias, offload_stream)
                 return y.reshape(*x_shape[:-1], y.shape[-1])
         
         # Pass-through for other layers
