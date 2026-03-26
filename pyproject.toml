@@ -1,0 +1,23 @@
+[project]
+name = "int8-fast"
+description = "This node speeds up Flux2, Chroma, Z-Image Turbo, Qwen Image in ComfyUI by using INT8 quantization on RTX 20 and 30 series cards, delivering 1.5~2x faster inference in tests with an RTX3090."
+version = "1.0.0"
+license = {file = "LICENSE"} 
+classifiers = [
+"Operating System :: OS Independent",
+"Environment :: GPU :: NVIDIA CUDA",
+]
+
+
+[project.urls]
+Repository = "https://github.com/BobJohnson24/ComfyUI-INT8-Fast"
+Documentation = "https://github.com/BobJohnson24/ComfyUI-INT8-Fast/wiki"
+"Bug Tracker" = "https://github.com/BobJohnson24/ComfyUI-INT8-Fast/issues"
+
+[tool.comfy]
+PublisherId = "bobjohnson"
+DisplayName = "ComfyUI-INT8-Fast"
+Icon = ""
+includes = [] 
+# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+
