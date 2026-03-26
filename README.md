@@ -1,8 +1,5 @@
 # Comfy INT8 Acceleration
 
-> [!CAUTION]
-> [This node is tested with an older version of comfyui.  ](https://github.com/Comfy-Org/ComfyUI/tree/667a1b8878187f7a5c8955b272e33c16e4c46bb7) On newer versions, you will have to run Comfy with --disable-dynamic-vram. It is generally recommended to not use newer comfy versions unless absolutely needed as somewhere along the way they caused a performance regression for this node. In concrete terms, with Qwen Image we used to run at 1.74s/it on the older version. Now it's 2.08s/it. For a 27 step inference that adds up to about 10 extra seconds. PR's are welcome if you can fix this.
-
 This node speeds up Flux2, Chroma, Z-Image in ComfyUI by using INT8 quantization, delivering between 1.5~2x faster inference on my 3090 depending on the model. It should work on any NVIDIA GPU with enough INT8 TOPS. It's unlikely to be faster than proper FP8 on 40-Series and above. 
 Works with lora*, torch compile (needed to get full speedup).
 
