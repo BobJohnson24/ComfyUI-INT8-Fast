@@ -1,7 +1,7 @@
 [project]
 name = "int8-fast"
 description = "This node speeds up Flux2, Chroma, Z-Image Turbo, Qwen Image in ComfyUI by using INT8 quantization on RTX 20 and 30 series cards, delivering 1.5~2x faster inference in tests with an RTX3090."
-version = "1.0.0"
+version = "1.0.1"
 license = {file = "LICENSE"} 
 classifiers = [
 "Operating System :: OS Independent",
