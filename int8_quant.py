@@ -117,6 +117,89 @@ def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor
 # INT8 LoRA Adapter - High Precision, Low RAM Patching
 # =============================================================================
 
+def reconstruct_lora_diff(weights, target_shape, device, dtype, strength):
+    """
+    Reconstructs the low-rank delta in high precision for different adapter types.
+    Supports LoRA, LoHA, and LoKR.
+    """
+    import comfy.model_management
+    
+    def cast(t):
+        return comfy.model_management.cast_to_device(t, device, dtype)
+
+    v = weights
+    # -------------------------------------------------------------------------
+    # Case 1: LoRA (used by LoRAAdapter)
+    # weights: (up, down, alpha, mid, dora_scale, reshape)
+    # -------------------------------------------------------------------------
+    if len(v) == 6:
+        up, down, alpha, mid, dora, reshape = v
+        up_f = cast(up)
+        down_f = cast(down)
+        rank = down.shape[0]
+        scale = (alpha / rank) * strength if alpha is not None else strength
+        
+        if mid is not None:
+            mid_f = cast(mid)
+            # LoCon/LoHA style Tucker: up @ mid @ down
+            lora_diff = torch.mm(up_f.flatten(1), torch.mm(mid_f.flatten(1), down_f.flatten(1)))
+        else:
+            lora_diff = torch.mm(up_f.flatten(1), down_f.flatten(1))
+            
+        return lora_diff.reshape(target_shape), scale
+
+    # -------------------------------------------------------------------------
+    # Case 2: LoHA (used by LoHAAdapter)
+    # weights: (w1a, w1b, alpha, w2a, w2b, t1, t2, dora_scale)
+    # -------------------------------------------------------------------------
+    elif len(v) == 8:
+        w1a, w1b, alpha, w2a, w2b, t1, t2, dora = v
+        rank = w1b.shape[0]
+        scale = (alpha / rank) * strength if alpha is not None else strength
+        
+        if t1 is not None:
+             m1 = torch.einsum("i j k l, j r, i p -> p r k l", cast(t1), cast(w1b), cast(w1a))
+             m2 = torch.einsum("i j k l, j r, i p -> p r k l", cast(t2), cast(w2b), cast(w2a))
+        else:
+             m1 = torch.mm(cast(w1a), cast(w1b))
+             m2 = torch.mm(cast(w2a), cast(w2b))
+        
+        lora_diff = (m1 * m2)
+        return lora_diff.reshape(target_shape), scale
+
+    # -------------------------------------------------------------------------
+    # Case 3: LoKR (used by LoKrAdapter)
+    # weights: (w1, w2, alpha, w1a, w1b, w2a, w2b, t2, dora_scale)
+    # -------------------------------------------------------------------------
+    elif len(v) == 9:
+        w1, w2, alpha, w1a, w1b, w2a, w2b, t2, dora = v
+        dim = None
+        
+        if w1 is None:
+            dim = w1b.shape[0]
+            w1_f = torch.mm(cast(w1a), cast(w1b))
+        else:
+            w1_f = cast(w1)
+            
+        if w2 is None:
+            dim = w2b.shape[0]
+            if t2 is None:
+                w2_f = torch.mm(cast(w2a), cast(w2b))
+            else:
+                w2_f = torch.einsum("i j k l, j r, i p -> p r k l", cast(t2), cast(w2b), cast(w2a))
+        else:
+            w2_f = cast(w2)
+            
+        if len(w2_f.shape) == 4:
+            w1_f = w1_f.unsqueeze(2).unsqueeze(2)
+            
+        scale = (alpha / dim) * strength if (alpha is not None and dim is not None) else strength
+        lora_diff = torch.kron(w1_f, w2_f)
+        return lora_diff.reshape(target_shape), scale
+
+    return None, 1.0
+
+
 try:
     from comfy.weight_adapter.lora import LoRAAdapter
     _LORA_ADAPTER_AVAILABLE = True
@@ -155,30 +238,46 @@ if _LORA_ADAPTER_AVAILABLE:
                 return ws[: delta_f.shape[0]]
             return ws
 
+        def _get_effective_scale(self, delta_f, offset):
+            """Slice weight_scale to match delta_f when dealing with merged QKV LoRAs.
+            
+            ComfyUI narrows the full weight to a Q/K/V slice before calling us,
+            but weight_scale is still the full merged tensor, so we need to match it.
+            """
+            ws = self.weight_scale
+            if not isinstance(ws, torch.Tensor) or ws.numel() == 1:
+                return ws  # scalar – always fine
+            
+            # offset = (dim, start, size) as set by ComfyUI for merged QKV layers
+            if offset is not None:
+                dim, start, size = offset
+                if dim < ws.dim() and ws.shape[dim] > start:
+                    # Double check if size matches, or if we can safely narrow
+                    narrow_size = min(size, ws.shape[dim] - start)
+                    return ws.narrow(dim, start, narrow_size)
+            
+            # No offset, but still mismatched (e.g. separate-weight LoRA vs merged model):
+            # try to detect which chunk by matching row count
+            if ws.shape[0] != delta_f.shape[0] and ws.shape[0] % delta_f.shape[0] == 0:
+                return ws[: delta_f.shape[0]]
+                
+            return ws
+
         def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
             if intermediate_dtype == torch.int8:
                 intermediate_dtype = torch.float32
                 
-            v = self.weights
-            up, down, alpha = v[0], v[1], v[2]
-            
-            rank = down.shape[0] if down.ndim >= 2 else 1
-            scale = (alpha / rank) * strength if alpha is not None else strength
-            
-            device = weight.device
-            
             # Compute LoRA Delta in high-precision on GPU
+            device = weight.device
             comp_device = torch.device("cuda") if torch.cuda.is_available() else device
             
-            up_f = up.to(comp_device, dtype=intermediate_dtype)
-            down_f = down.to(comp_device, dtype=intermediate_dtype)
+            # Unified reconstruction for LoRA, LoHA, LoKR
+            lora_diff, scale = reconstruct_lora_diff(
+                self.weights, weight.shape, comp_device, intermediate_dtype, strength
+            )
             
-            # Handle possible mid weights (LoCon/LoHA)
-            if v[3] is not None:
-                mid_f = v[3].to(comp_device, dtype=intermediate_dtype)
-                lora_diff = torch.mm(up_f.flatten(1), torch.mm(mid_f.flatten(1), down_f.flatten(1))).reshape(weight.shape)
-            else:
-                lora_diff = torch.mm(up_f.flatten(1), down_f.flatten(1)).reshape(weight.shape)
+            if lora_diff is None:
+                return weight
             
             # Apply Patch
             if weight.dtype == torch.int8:
@@ -234,20 +333,12 @@ if _LORA_ADAPTER_AVAILABLE:
             total_delta_f = None
             
             for adapter, lora_strength in self.patches:
-                v = adapter.weights
-                up, down, alpha = v[0], v[1], v[2]
+                # Unified reconstruction for each adapter in the stack
+                delta, scale = reconstruct_lora_diff(
+                    adapter.weights, weight.shape, comp_device, intermediate_dtype, lora_strength
+                )
                 
-                rank = down.shape[0] if down.ndim >= 2 else 1
-                scale = (alpha / rank) * lora_strength if alpha is not None else lora_strength
-                
-                up_f = up.to(comp_device, dtype=intermediate_dtype)
-                down_f = down.to(comp_device, dtype=intermediate_dtype)
-                
-                if v[3] is not None:
-                    mid_f = v[3].to(comp_device, dtype=intermediate_dtype)
-                    delta = torch.mm(up_f.flatten(1), torch.mm(mid_f.flatten(1), down_f.flatten(1))).reshape(weight.shape)
-                else:
-                    delta = torch.mm(up_f.flatten(1), down_f.flatten(1)).reshape(weight.shape)
+                if delta is None: continue
                 
                 if total_delta_f is None:
                     total_delta_f = delta * scale
