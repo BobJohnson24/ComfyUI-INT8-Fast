@@ -35,9 +35,11 @@ Make sure to update the node to use them as int8 row-wise was added.
 | Model | Link |
 |-------|------|
 | Chroma1-HD | [Download](https://huggingface.co/bertbobson/Chroma1-HD-INT8Tensorwise) |
-| Z-Image-Base | [Download](https://huggingface.co/bertbobson/Z-Image-Base-INT8-QUIP) |
+| Z-Image-Base* | ~~[Download](https://huggingface.co/bertbobson/Z-Image-Base-INT8-QUIP)~~ 
 | Z-Image-Turbo | [Download](https://huggingface.co/bertbobson/Z-Image-Turbo-INT8-Tensorwise) |
 | Anima | [Download](https://huggingface.co/bertbobson/Anima-INT8-QUIP) |
+
+*Z-Image Base weights have been Deprecated in favor of Quarot OTF, which is higher quality.
 
 
 # Metrics:
