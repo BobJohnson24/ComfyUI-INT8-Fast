@@ -78,6 +78,8 @@ https://github.com/Nerogar/OneTrainer/pull/1034
 
 If you have a 30-Series GPU, OneTrainer is also the fastest current lora trainer thanks to this. Please go check them out!!
 
+## newgrit1004 for the QuaRot code I basically copied
+https://github.com/newgrit1004/ComfyUI-ZImage-Triton
 
 ## silveroxides for providing a base to hack the INT8 conversion code onto.
 https://github.com/silveroxides/convert_to_quant
