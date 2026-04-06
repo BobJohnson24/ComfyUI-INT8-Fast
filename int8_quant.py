@@ -12,6 +12,9 @@ except ImportError:
     _TRITON_AVAILABLE = False
     print("Triton not found, falling back to torch._int_mm")
 
+# Runtime toggle — set by Int8TensorwiseOps.use_triton via the loader node
+_use_triton = True
+
 # --- Quantization Utils ---
 
 def quantize_int8(x: Tensor, scale: float | Tensor) -> Tensor:
@@ -61,7 +64,7 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     """Forward with dynamic per-token activation quantization."""
     
     # --- FAST PATH: Triton Fused Kernel ---
-    if _TRITON_AVAILABLE and x.is_cuda:
+    if _TRITON_AVAILABLE and _use_triton and x.is_cuda:
         return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
@@ -92,7 +95,7 @@ def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor
         compute_dtype: Output dtype
     """
     # --- FAST PATH: Triton Fused Kernel (per-row) ---
-    if _TRITON_AVAILABLE and x.is_cuda:
+    if _TRITON_AVAILABLE and _use_triton and x.is_cuda:
         return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
@@ -283,6 +286,17 @@ if _LORA_ADAPTER_AVAILABLE:
             if weight.dtype == torch.int8:
                 # --- INT8 SPACE PATCHING ---
                 delta_f = lora_diff * scale
+
+                # If QuaRot was applied to this layer's weights, rotate the delta into the same
+                # basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
+                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % 128 == 0:
+                    try:
+                        from .quarot import build_hadamard, rotate_weight
+                        H = build_hadamard(128, device=comp_device, dtype=delta_f.dtype)
+                        delta_f = rotate_weight(delta_f, H, group_size=128)
+                    except ImportError:
+                        pass
+
                 eff_scale = self._get_effective_scale(delta_f, offset)
                 delta_int8 = stochastic_round_int8_delta(delta_f, eff_scale, self.seed)
                 
@@ -350,6 +364,17 @@ if _LORA_ADAPTER_AVAILABLE:
 
             if weight.dtype == torch.int8:
                 # One single stochastic rounding step for all combined LoRAs
+
+                # If QuaRot was applied to this layer's weights, rotate the combined delta into
+                # the same basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
+                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % 128 == 0:
+                    try:
+                        from .quarot import build_hadamard, rotate_weight
+                        H = build_hadamard(128, device=comp_device, dtype=total_delta_f.dtype)
+                        total_delta_f = rotate_weight(total_delta_f, H, group_size=128)
+                    except ImportError:
+                        pass
+
                 eff_scale = self._get_effective_scale(total_delta_f, offset)
                 delta_int8 = stochastic_round_int8_delta(total_delta_f, eff_scale, self.seed)
                 res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
@@ -475,6 +500,8 @@ if _COMFY_OPS_AVAILABLE:
         """
         excluded_names = []
         dynamic_quantize = False # Manual toggle for on-the-fly quantization
+        enable_quarot = False # Toggle for QuaRot Hadamard rotation
+        use_triton = True  # Toggle for Triton fused kernel (mirrors _use_triton)
         _is_prequantized = False # Keep this as a status flag, but don't use for detection
         
         class Linear(manual_cast.Linear):
@@ -483,6 +510,7 @@ if _COMFY_OPS_AVAILABLE:
                 self.register_buffer('weight_scale', None)
                 self._is_quantized = False
                 self._is_per_row = False  # Track quantization granularity
+                self._use_quarot = False  # Track if QuaRot was applied
                 self._weight_scale_scalar = None  # For scalar (non-tensor) scales
                 self.compute_dtype = torch.bfloat16
                 self.lora_A = None
@@ -542,18 +570,29 @@ if _COMFY_OPS_AVAILABLE:
                         else:
                             # Quantize on the fly
                             device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
-                            w_gpu = weight_tensor.to(device, non_blocking=True)
-                            q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
+                            # Cast to float32 before rotation and scale computation, may be snake oil but can it hurt?
+                            w_gpu = weight_tensor.to(device, non_blocking=True).float()
                             
+                            self._use_quarot = False
+                            if getattr(Int8TensorwiseOps, "enable_quarot", False) and self.in_features % 128 == 0:
+                                try:
+                                    import logging
+                                    from .quarot import build_hadamard, rotate_weight
+                                    H = build_hadamard(128, device=w_gpu.device, dtype=w_gpu.dtype)
+                                    w_gpu = rotate_weight(w_gpu, H, group_size=128)
+                                    self._use_quarot = True
+                                except ImportError as e:
+                                    import logging
+                                    logging.warning(f"Int88: QuaRot enabled but quarot module error: {e}")
+                                    
+                            q_weight, q_scale = quantize_int8_axiswise(w_gpu, dim=1)
+
+
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
-                            if isinstance(q_scale, torch.Tensor):
-                                self.register_buffer('weight_scale', q_scale.cpu())
-                                self._weight_scale_scalar = None
-                            else:
-                                self._weight_scale_scalar = float(q_scale)
-                                self.weight_scale = None
+                            self.register_buffer('weight_scale', q_scale.cpu())
+                            self._weight_scale_scalar = None
                             self._is_quantized = True
-                            self._is_per_row = False
+                            self._is_per_row = True
                     else:
                         self._is_quantized = False
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
@@ -674,6 +713,16 @@ if _COMFY_OPS_AVAILABLE:
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
                 
+                if getattr(self, "_use_quarot", False):
+                    from .quarot import build_hadamard, rotate_activation
+                    H = build_hadamard(128, device=x.device, dtype=x.dtype)
+                    x_2d = rotate_activation(x_2d, H, group_size=128)
+                
+                # Sync the loader toggle to the module-level flag read by the forward fns
+                import sys as _sys
+                _mod = _sys.modules[__name__]
+                _mod._use_triton = Int8TensorwiseOps.use_triton
+
                 if x_2d.shape[0] > 16:
                     if self._is_per_row:
                         y = int8_forward_dynamic_per_row(x_2d, weight, w_scale, bias, compute_dtype)
