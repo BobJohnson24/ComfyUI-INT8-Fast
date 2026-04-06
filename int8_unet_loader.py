@@ -23,6 +23,8 @@ class UNetLoaderINTW8A8:
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
                 "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen"],),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False}),
+                "enable_quarot": ("BOOLEAN", {"default": False, "tooltip": "Enable QuaRot (Hadamard rotation) for better quantization."}),
+                #"enable_triton": ("BOOLEAN", {"default": True, "tooltip": "Use the Triton fused INT8 kernel. Disable to fall back to torch._int_mm (useful for debugging or unsupported GPUs)."}),
             }
         }
 
@@ -31,7 +33,7 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_quarot=False):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
         # Use Int8TensorwiseOps for proper direct int8 loading
@@ -44,6 +46,8 @@ class UNetLoaderINTW8A8:
         # Set quantization flags
         Int8TensorwiseOps.excluded_names = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
+        Int8TensorwiseOps.enable_quarot = enable_quarot
+        Int8TensorwiseOps.use_triton = True
         Int8TensorwiseOps._is_prequantized = False
         
         # Check explicit model_type for exclusions
@@ -57,7 +61,7 @@ class UNetLoaderINTW8A8:
             Int8TensorwiseOps.excluded_names = [
                 'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
                 'final_layer', 'noise_refiner', 'adaLN',
-                'x_pad_token',
+                'x_pad_token', 'layers.0.',
             ]
         elif model_type == "chroma":
             Int8TensorwiseOps.excluded_names = [
