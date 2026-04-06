@@ -18,7 +18,7 @@ Works with lora*, torch compile (needed to get full speedup).
 - **Performance:** ~1.15x slower due to dynamic calculations
 - **Quality:** Possibly slightly higher quality
 
-Pre-quantized checkpoints are recommended for most architectures.
+Pre-quantized checkpoints were recommended for most architectures, but on-the-fly quantization with QuaRot can be better in a few cases.
 
 **Shoutout to [vistralis](https://huggingface.co/vistralis) for these:** 
 Make sure to update the node to use them as int8 row-wise was added.
