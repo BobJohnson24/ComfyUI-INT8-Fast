@@ -47,6 +47,7 @@ class INT8LoraLoader:
         
         # Use ComfyUI's load_lora to handle various LoRA formats
         patch_dict = comfy.lora.load_lora(lora, key_map, log_missing=True)
+        del lora # Free raw state dict
         
         # Upgrade patches for high-precision INT8-space patching
         from .int8_quant import INT8LoRAPatchAdapter
@@ -150,6 +151,7 @@ class INT8LoraLoaderStack:
         layered_patches = {} # key -> list of (adapter, strength)
         for data, strength, name in all_loras:
             patch_dict = comfy.lora.load_lora(data, key_map, log_missing=True)
+            del data # Free raw state dict
             for key, adapter in patch_dict.items():
                 if key not in layered_patches:
                     layered_patches[key] = []

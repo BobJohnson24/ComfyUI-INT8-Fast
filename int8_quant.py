@@ -49,10 +49,15 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
     # Stochastic rounding
     x_floor = torch.floor(x_scaled)
     fraction = x_scaled - x_floor
+    del x_scaled # High-precision input no longer needed
     
     # Speed optimization: Create random values directly on the target device
-    random_vals = torch.rand(x_scaled.shape, generator=generator, device=x.device, dtype=x_scaled.dtype)
+    random_vals = torch.rand(x_floor.shape, generator=generator, device=x.device, dtype=x_floor.dtype)
     x_rounded = torch.where(random_vals < fraction, x_floor + 1, x_floor)
+    
+    del random_vals
+    del fraction
+    del x_floor
     
     return torch.clamp(x_rounded, -128, 127).to(torch.int8)
 
@@ -270,9 +275,11 @@ if _LORA_ADAPTER_AVAILABLE:
             if intermediate_dtype == torch.int8:
                 intermediate_dtype = torch.float32
                 
-            # Compute LoRA Delta in high-precision on GPU
+            # Compute LoRA Delta in high-precision. 
+            # Respect ComfyUI's device selection for computation.
             device = weight.device
-            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+            import comfy.model_management
+            comp_device = comfy.model_management.get_torch_device()
             
             # Unified reconstruction for LoRA, LoHA, LoKR
             lora_diff, scale = reconstruct_lora_diff(
@@ -286,6 +293,7 @@ if _LORA_ADAPTER_AVAILABLE:
             if weight.dtype == torch.int8:
                 # --- INT8 SPACE PATCHING ---
                 delta_f = lora_diff * scale
+                del lora_diff # Free memory immediately
 
                 # If QuaRot was applied to this layer's weights, rotate the delta into the same
                 # basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
@@ -299,13 +307,20 @@ if _LORA_ADAPTER_AVAILABLE:
 
                 eff_scale = self._get_effective_scale(delta_f, offset)
                 delta_int8 = stochastic_round_int8_delta(delta_f, eff_scale, self.seed)
+                del delta_f # Free high-precision delta
                 
                 # Perform integer addition (int32 for safety) then clamp
                 res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
-                return torch.clamp(res, -128, 127).to(torch.int8).to(device)
+                del delta_int8 # Free temporary INT8 delta
+                
+                final_weight = torch.clamp(res, -128, 127).to(torch.int8).to(device)
+                del res
+                return final_weight
             else:
                 # Fallback: Standard Float Patching
-                return weight + (lora_diff * scale).to(weight.device, weight.dtype)
+                final_weight = weight + (lora_diff * scale).to(weight.device, weight.dtype)
+                del lora_diff
+                return final_weight
 
     class INT8MergedLoRAPatchAdapter(LoRAAdapter):
         """
@@ -358,6 +373,8 @@ if _LORA_ADAPTER_AVAILABLE:
                     total_delta_f = delta * scale
                 else:
                     total_delta_f += delta * scale
+                
+                del delta # Free high-precision intermediate
             
             if total_delta_f is None:
                 return weight
@@ -377,10 +394,18 @@ if _LORA_ADAPTER_AVAILABLE:
 
                 eff_scale = self._get_effective_scale(total_delta_f, offset)
                 delta_int8 = stochastic_round_int8_delta(total_delta_f, eff_scale, self.seed)
+                del total_delta_f # Free combined high-precision delta
+                
                 res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
-                return torch.clamp(res, -128, 127).to(torch.int8).to(device)
+                del delta_int8 # Free temporary INT8 delta
+                
+                final_weight = torch.clamp(res, -128, 127).to(torch.int8).to(device)
+                del res
+                return final_weight
             else:
-                return weight + total_delta_f.to(device, weight.dtype)
+                final_weight = weight + total_delta_f.to(device, weight.dtype)
+                del total_delta_f
+                return final_weight
 
 
 # =============================================================================
