@@ -21,7 +21,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen"],),
+                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie"],),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False}),
                 "enable_quarot": ("BOOLEAN", {"default": False, "tooltip": "Enable QuaRot (Hadamard rotation) for better quantization."}),
                 #"enable_triton": ("BOOLEAN", {"default": True, "tooltip": "Use the Triton fused INT8 kernel. Disable to fall back to torch._int_mm (useful for debugging or unsupported GPUs)."}),
@@ -71,6 +71,10 @@ class UNetLoaderINTW8A8:
         elif model_type == "qwen":
             Int8TensorwiseOps.excluded_names = [
                 'time_text_embed', 'img_in', 'norm_out', 'proj_out', 'txt_in'
+            ]
+        elif model_type == "ernie":
+            Int8TensorwiseOps.excluded_names = [
+                'time', 'x_embedder', 'adaLN', 'final' 'text_proj', 'norm', 'layers.0.', 'layers.35',
             ]
         elif model_type == "wan":
             Int8TensorwiseOps.excluded_names = [
