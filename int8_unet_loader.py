@@ -74,7 +74,7 @@ class UNetLoaderINTW8A8:
             ]
         elif model_type == "ernie":
             Int8TensorwiseOps.excluded_names = [
-                'time', 'x_embedder', 'adaLN', 'final' 'text_proj', 'norm', 'layers.0.', 'layers.35',
+                'time', 'x_embedder', 'adaLN', 'final', 'text_proj', 'norm', 'layers.0.', 'layers.35',
             ]
         elif model_type == "anima":
             Int8TensorwiseOps.excluded_names = [
