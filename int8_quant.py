@@ -608,7 +608,7 @@ if _COMFY_OPS_AVAILABLE:
                                     self._use_quarot = True
                                 except ImportError as e:
                                     import logging
-                                    logging.warning(f"Int88: QuaRot enabled but quarot module error: {e}")
+                                    logging.warning(f"INT8 Fast: QuaRot enabled but quarot module error: {e}")
                                     
                             q_weight, q_scale = quantize_int8_axiswise(w_gpu, dim=1)
 

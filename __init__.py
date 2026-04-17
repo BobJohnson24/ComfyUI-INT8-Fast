@@ -1,5 +1,5 @@
 """
-int88 - Fast INT8 Tensorwise Quantization for ComfyUI
+INT8 Fast - INT8 Tensorwise Quantization for ComfyUI
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
@@ -62,9 +62,9 @@ def _register_layouts():
         )
         
     except ImportError:
-        logging.warning("Int88: ComfyUI Quantization system not found (Update ComfyUI?)")
+        logging.warning("INT8 Fast: ComfyUI Quantization system not found (Update ComfyUI?)")
     except Exception as e:
-        logging.error(f"Int88: Failed to register layouts: {e}")
+        logging.error(f"INT8 Fast: Failed to register layouts: {e}")
 
 
 # =============================================================================
