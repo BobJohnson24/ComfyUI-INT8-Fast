@@ -15,6 +15,9 @@ except ImportError:
 # Runtime toggle — set by Int8TensorwiseOps.use_triton via the loader node
 _use_triton = True
 
+# QuaRot Configuration
+QUAROT_GROUP_SIZE = 256  # Must be a power of 4 for Regular Hadamard (e.g. 16, 64, 256)
+
 # --- Quantization Utils ---
 
 def quantize_int8(x: Tensor, scale: float | Tensor) -> Tensor:
@@ -297,11 +300,12 @@ if _LORA_ADAPTER_AVAILABLE:
 
                 # If QuaRot was applied to this layer's weights, rotate the delta into the same
                 # basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
-                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % 128 == 0:
+                group_size = getattr(Int8TensorwiseOps, '_global_quarot_groupsize', QUAROT_GROUP_SIZE)
+                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % group_size == 0:
                     try:
                         from .quarot import build_hadamard, rotate_weight
-                        H = build_hadamard(128, device=comp_device, dtype=delta_f.dtype)
-                        delta_f = rotate_weight(delta_f, H, group_size=128)
+                        H = build_hadamard(group_size, device=comp_device, dtype=delta_f.dtype)
+                        delta_f = rotate_weight(delta_f, H, group_size=group_size)
                     except ImportError:
                         pass
 
@@ -384,11 +388,12 @@ if _LORA_ADAPTER_AVAILABLE:
 
                 # If QuaRot was applied to this layer's weights, rotate the combined delta into
                 # the same basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
-                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % 128 == 0:
+                group_size = getattr(Int8TensorwiseOps, '_global_quarot_groupsize', QUAROT_GROUP_SIZE)
+                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % group_size == 0:
                     try:
                         from .quarot import build_hadamard, rotate_weight
-                        H = build_hadamard(128, device=comp_device, dtype=total_delta_f.dtype)
-                        total_delta_f = rotate_weight(total_delta_f, H, group_size=128)
+                        H = build_hadamard(group_size, device=comp_device, dtype=total_delta_f.dtype)
+                        total_delta_f = rotate_weight(total_delta_f, H, group_size=group_size)
                     except ImportError:
                         pass
 
@@ -551,12 +556,39 @@ if _COMFY_OPS_AVAILABLE:
                 input_scale_key = prefix + "input_scale"
                 bias_key = prefix + "bias"
                 
-                weight_scale = state_dict.pop(scale_key, None)
-                state_dict.pop(prefix + "comfy_quant", None)
+                def pop_metadata(sd, p, k):
+                    v = sd.pop(p + k, None)
+                    if v is not None: return v
+                    v = sd.pop("model." + p + k, None)
+                    if v is not None: return v
+                    if p.startswith("model."):
+                        v = sd.pop(p[6:] + k, None)
+                        if v is not None: return v
+                    if p.startswith("diffusion_model."):
+                        v = sd.pop("diffusion_model." + p + k, None)
+                        if v is not None: return v
+                    return None
+
+                weight_scale = pop_metadata(state_dict, prefix, "weight_scale")
+                comfy_quant_tensor = pop_metadata(state_dict, prefix, "comfy_quant")
+
                 weight_tensor = state_dict.pop(weight_key, None)
 
                 # Pop input_scale to clean state_dict, but ignore it
                 _ = state_dict.pop(input_scale_key, None)
+                
+                if comfy_quant_tensor is not None:
+                    try:
+                        import json
+                        quant_conf = json.loads(bytes(comfy_quant_tensor.tolist()).decode('utf-8'))
+                        if quant_conf.get("quarot", False):
+                            self._use_quarot = True
+                            Int8TensorwiseOps.enable_quarot = True  # Propagate globally for LoRAs
+                            if "quarot_groupsize" in quant_conf:
+                                self._quarot_groupsize = quant_conf["quarot_groupsize"]
+                                Int8TensorwiseOps._global_quarot_groupsize = self._quarot_groupsize
+                    except Exception:
+                        pass
                 
                 if weight_tensor is not None:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
@@ -595,23 +627,28 @@ if _COMFY_OPS_AVAILABLE:
                         else:
                             # Quantize on the fly
                             device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
+                            
+                            # Log the first time we quantize in this loader pass
+                            if not hasattr(Int8TensorwiseOps, '_logged_otf'):
+                                print(f"INT8 Fast: Quantizing on-the-fly (QuaRot: {getattr(Int8TensorwiseOps, 'enable_quarot', False)})")
+                                Int8TensorwiseOps._logged_otf = True
+
                             # Cast to float32 before rotation and scale computation, may be snake oil but can it hurt?
                             w_gpu = weight_tensor.to(device, non_blocking=True).float()
                             
                             self._use_quarot = False
-                            if getattr(Int8TensorwiseOps, "enable_quarot", False) and self.in_features % 128 == 0:
+                            if getattr(Int8TensorwiseOps, "enable_quarot", False) and self.in_features % QUAROT_GROUP_SIZE == 0:
                                 try:
                                     import logging
                                     from .quarot import build_hadamard, rotate_weight
-                                    H = build_hadamard(128, device=w_gpu.device, dtype=w_gpu.dtype)
-                                    w_gpu = rotate_weight(w_gpu, H, group_size=128)
+                                    H = build_hadamard(QUAROT_GROUP_SIZE, device=w_gpu.device, dtype=w_gpu.dtype)
+                                    w_gpu = rotate_weight(w_gpu, H, group_size=QUAROT_GROUP_SIZE)
                                     self._use_quarot = True
                                 except ImportError as e:
                                     import logging
                                     logging.warning(f"INT8 Fast: QuaRot enabled but quarot module error: {e}")
                                     
                             q_weight, q_scale = quantize_int8_axiswise(w_gpu, dim=1)
-
 
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
                             self.register_buffer('weight_scale', q_scale.cpu())
@@ -740,8 +777,9 @@ if _COMFY_OPS_AVAILABLE:
                 
                 if getattr(self, "_use_quarot", False):
                     from .quarot import build_hadamard, rotate_activation
-                    H = build_hadamard(128, device=x.device, dtype=x.dtype)
-                    x_2d = rotate_activation(x_2d, H, group_size=128)
+                    group_size = getattr(self, "_quarot_groupsize", QUAROT_GROUP_SIZE)
+                    H = build_hadamard(group_size, device=x.device, dtype=x.dtype)
+                    x_2d = rotate_activation(x_2d, H, group_size=group_size)
                 
                 # Sync the loader toggle to the module-level flag read by the forward fns
                 import sys as _sys

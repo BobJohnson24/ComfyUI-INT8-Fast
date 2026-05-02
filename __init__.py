@@ -86,6 +86,7 @@ try:
     from .int8_unet_loader import UNetLoaderINTW8A8
     from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
     from .int8_dynamic_lora import INT8DynamicLoraLoader, INT8DynamicLoraStack
+    from .int8_save import INT8ModelSave
     
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
@@ -93,6 +94,7 @@ try:
         "INT8LoraLoaderStack": INT8LoraLoaderStack,
         "INT8DynamicLoraLoader": INT8DynamicLoraLoader,
         "INT8DynamicLoraStack": INT8DynamicLoraStack,
+        "INT8ModelSave": INT8ModelSave,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
@@ -101,6 +103,7 @@ try:
         "INT8LoraLoaderStack": "INT8 LoRA Stack (Stochastic)",
         "INT8DynamicLoraLoader": "Load LoRA INT8 (Dynamic)",
         "INT8DynamicLoraStack": "INT8 LoRA Stack (Dynamic)",
+        "INT8ModelSave": "Save Int8 Model",
     }
 except ImportError as e:
     logging.error(f"Int88: Failed to import nodes: {e}")

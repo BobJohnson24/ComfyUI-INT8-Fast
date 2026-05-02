@@ -20,24 +20,40 @@ def build_hadamard(
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Build a normalized orthogonal Hadamard matrix.
-
-    Returns H such that H @ H^T = I (orthogonal).
-    Size must be a power of 2.
+    """Build a normalized REGULAR orthogonal Hadamard matrix (ConvRot).
+    
+    Size must be a power of 4 (e.g., 4, 16, 64, 256, 1024...).
+    Uses the Kronecker construction from Theorem 3.3 to avoid the all-1s 
+    column of standard Sylvester Hadamard matrices, which amplifies 
+    row-wise outliers in diffusion models.
     """
+    import math
     cache_key = (size, str(device), dtype)
     if cache_key in _HADAMARD_CACHE:
         return _HADAMARD_CACHE[cache_key]
 
-    if size & (size - 1) != 0:
-        raise ValueError(f"Hadamard size must be power of 2, got {size}")
+    if size < 4 or (size & (size - 1)) != 0 or math.log(size, 4) % 1 != 0:
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
 
-    H_np = scipy_hadamard(size)
-    H = torch.tensor(H_np, dtype=dtype, device=device) / (size**0.5)
+    # Base H4 from Theorem 3.3 (Eq 9 in the paper)
+    # Notice how every row and column sums to exactly 2
+    H4 = torch.tensor([[ 1,  1,  1, -1],
+        [ 1,  1, -1,  1],[ 1, -1,  1,  1],[-1,  1,  1,  1]
+    ], dtype=dtype, device=device)
 
-    _HADAMARD_CACHE[cache_key] = H
-    return H
+    H = H4
+    current_size = 4
+    
+    # Kronecker construction for larger sizes: H_{4^{k+1}} = H_{4^k} \otimes H_4
+    while current_size < size:
+        H = torch.kron(H, H4)
+        current_size *= 4
 
+    # Normalize to make it orthogonal
+    H_normalized = H / (size**0.5)
+    _HADAMARD_CACHE[cache_key] = H_normalized
+    
+    return H_normalized
 
 def rotate_weight(
     weight: torch.Tensor,

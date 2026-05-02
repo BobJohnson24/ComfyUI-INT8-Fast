@@ -49,11 +49,13 @@ class UNetLoaderINTW8A8:
         Int8TensorwiseOps.enable_quarot = enable_quarot
         Int8TensorwiseOps.use_triton = True
         Int8TensorwiseOps._is_prequantized = False
+        if hasattr(Int8TensorwiseOps, "_logged_otf"):
+            delattr(Int8TensorwiseOps, "_logged_otf")
         
         # Check explicit model_type for exclusions
         if model_type == "flux2":
             Int8TensorwiseOps.excluded_names = [
-                'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer', 
+                'img_in', 'time_in', 'guidance_in', 'txt_in', 
                 'double_stream_modulation_img', 'double_stream_modulation_txt', 
                 'single_stream_modulation',
             ]
@@ -74,11 +76,11 @@ class UNetLoaderINTW8A8:
             ]
         elif model_type == "ernie":
             Int8TensorwiseOps.excluded_names = [
-                'time', 'x_embedder', 'adaLN', 'final', 'text_proj', 'norm', 'layers.0.', 'layers.35',
+                'time', 'x_embedder', 'text_proj', #'adaLN', 'final', 'text_proj', 'norm', 'layers.0.', 'layers.35',
             ]
         elif model_type == "anima":
             Int8TensorwiseOps.excluded_names = [
-                'embed', 'llm', 'blocks.0.', 'blocks.1.', 'blocks.2.',
+                'embed', 'llm', 'adaln', #'blocks.0.', 'blocks.1.', 'blocks.27.', 'blocks.26.' 
             ]
         elif model_type == "wan":
             Int8TensorwiseOps.excluded_names = [
