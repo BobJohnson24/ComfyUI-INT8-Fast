@@ -15,7 +15,8 @@ Works with lora*, torch compile (needed to get full speedup).
 - **Quality:** Much higher quality than stochastic
 - I took this approach from city96/GGUF node.
 
-Pre-quantized checkpoints were recommended for most architectures, but on-the-fly quantization with QuaRot can be better in a few cases.
+Pre-quantized checkpoints were recommended for most architectures, but on-the-fly quantization with QuaRot is better in all cases.
+However, QuaRot is also a little slower, so these prequantized models are still useful.
 
 **Shoutout to [vistralis](https://huggingface.co/vistralis) for these:** 
 Make sure to update the node to use them as int8 row-wise was added.
