@@ -10,14 +10,10 @@ Works with lora*, torch compile (needed to get full speedup).
 - **Quality:** Possibly slightly lower quality
 - Use the included INT8 LoRA node
 
-### Option 2A: Included Int8 Dynamic LoRa Node
-- **Performance:** ~1.15x slower due to dynamic calculations
-- **Quality:** Possibly slightly higher quality
-- **Note:** Mostly deprecated now. I personally use #1, but #2B may also work.
-
-### Option 2B: Comfy's native Lora Bypass Node
-- **Performance:** ~1.15x slower due to dynamic calculations
-- **Quality:** Possibly slightly higher quality
+### Option 2: Just use the regular comfy lora node
+- **Performance:** Depending on rank it can be anywhere from 1.1-1.4x slower due to dynamic calculations
+- **Quality:** Much higher quality than stochastic
+- I took this approach from city96/GGUF node.
 
 Pre-quantized checkpoints were recommended for most architectures, but on-the-fly quantization with QuaRot can be better in a few cases.
 
