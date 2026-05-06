@@ -1,6 +1,9 @@
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+import comfy.model_patcher
+import comfy.lora
+import comfy.utils
 
 # Add this at the top of your file
 try:
@@ -227,27 +230,6 @@ if _LORA_ADAPTER_AVAILABLE:
             self.weight_scale = weight_scale
             self.seed = seed
 
-        def _get_effective_scale(self, delta_f, offset):
-            """Slice weight_scale to match delta_f when dealing with merged QKV LoRAs.
-            
-            ComfyUI narrows the full weight to a Q/K/V slice before calling us,
-            but weight_scale is still the full merged tensor, so we need to match it.
-            """
-            ws = self.weight_scale
-            if not isinstance(ws, torch.Tensor) or ws.numel() == 1:
-                return ws  # scalar – always fine
-            # offset = (dim, start, size) as set by ComfyUI for merged QKV layers
-            if offset is not None and ws.shape[0] != delta_f.shape[0]:
-                dim, start, size = offset
-                if dim == 0:
-                    return ws.narrow(0, start, size)
-            # No offset, but still mismatched (e.g. separate-weight LoRA vs merged model):
-            # try to detect which chunk by matching row count
-            if ws.shape[0] != delta_f.shape[0] and ws.shape[0] % delta_f.shape[0] == 0:
-                # We don't know which chunk, best we can do is use a scale subset.
-                # Row-0 is a reasonable default; this path is a rare edge case.
-                return ws[: delta_f.shape[0]]
-            return ws
 
         def _get_effective_scale(self, delta_f, offset):
             """Slice weight_scale to match delta_f when dealing with merged QKV LoRAs.
@@ -414,105 +396,6 @@ if _LORA_ADAPTER_AVAILABLE:
 
 
 # =============================================================================
-# Dynamic LoRA Synchronization Hook
-# =============================================================================
-
-class DynamicLoRAHook:
-    """
-    Hook registered on the diffusion_model to synchronize dynamic LoRA attributes
-    with the current ModelPatcher context at the start of each forward pass.
-    """
-    def __init__(self):
-        self.current_lora_id = None
-
-    def pre_forward(self, module, input_args, input_kwargs):
-        # 1. Try to find transformer_options
-        transformer_options = input_kwargs.get("transformer_options", {})
-        if not transformer_options:
-            # Fallback for models that pass it in context
-            context = input_args[2] if len(input_args) > 2 else None
-            if isinstance(context, dict) and "transformer_options" in context:
-                transformer_options = context["transformer_options"]
-        
-        dynamic_loras = transformer_options.get("dynamic_loras", [])
-        
-        # 2. Generate a unique ID for this set of LoRAs
-        # We use handles/strengths to detect changes
-        lora_id = hash(tuple((id(d["patches"]), d["strength"]) for d in dynamic_loras)) if dynamic_loras else None
-        
-        if lora_id == self.current_lora_id:
-            return None # Already synchronized
-            
-        # 3. Synchronize all linear layers
-        self.apply_composition(module, dynamic_loras)
-        self.current_lora_id = lora_id
-        return None
-
-    def apply_composition(self, diffusion_model, dynamic_loras):
-        # Pre-group patches by layer
-        layer_patches = {}
-        if dynamic_loras:
-            for entry in dynamic_loras:
-                strength = entry["strength"]
-                for key, adapter in entry["patches"].items():
-                    if key not in layer_patches: layer_patches[key] = []
-                    layer_patches[key].append((adapter, strength))
-
-        # Update all modules
-        for name, module in diffusion_model.named_modules():
-            if not hasattr(module, "lora_A"):
-                continue
-            
-            # Find patches for this module
-            # ComfyUI keys are often 'diffusion_model.path.to.weight' or 'path.to.weight'
-            possible_keys = [f"diffusion_model.{name}.weight", f"{name}.weight"]
-            patches = None
-            for pk in possible_keys:
-                if pk in layer_patches:
-                    patches = layer_patches[pk]
-                    break
-            
-            if not patches:
-                module.lora_A = None
-                module.lora_B = None
-                module.lora_alpha = None
-                continue
-
-            # Compose
-            all_A = []
-            all_B = []
-            for adapter, strength in patches:
-                v = adapter.weights
-                up, down, alpha, mid = v[0], v[1], v[2], v[3]
-                rank = down.shape[0] if down.ndim >= 2 else 1
-                scale = (alpha / rank) * strength if alpha is not None else strength
-                
-                curr_A = down
-                if mid is not None:
-                    curr_A = torch.mm(mid.flatten(1), down.flatten(1)).reshape(down.shape)
-                
-                all_A.append(curr_A * scale)
-                all_B.append(up)
-            
-            if all_A:
-                device = getattr(module, "weight", torch.tensor(0)).device
-                module.lora_A = torch.cat(all_A, dim=0).to(device)
-                module.lora_B = torch.cat(all_B, dim=1).to(device)
-                module.lora_alpha = None
-            else:
-                module.lora_A = None
-                module.lora_B = None
-
-    @classmethod
-    def register(cls, diffusion_model):
-        if not hasattr(diffusion_model, "_dynamic_lora_hook"):
-            hook = cls()
-            diffusion_model._dynamic_lora_hook = hook
-            diffusion_model.register_forward_pre_hook(hook.pre_forward, with_kwargs=True)
-        return diffusion_model._dynamic_lora_hook
-
-
-# =============================================================================
 # Int8TensorwiseOps - ComfyUI Custom Operations
 # =============================================================================
 
@@ -543,9 +426,7 @@ if _COMFY_OPS_AVAILABLE:
                 self._use_quarot = False  # Track if QuaRot was applied
                 self._weight_scale_scalar = None  # For scalar (non-tensor) scales
                 self.compute_dtype = torch.bfloat16
-                self.lora_A = None
-                self.lora_B = None
-                self.lora_alpha = None
+                self.lora_patches = []  # List of (down_scaled, up, start, size) set by INT8ModelPatcher
             
             def reset_parameters(self):
                 return None
@@ -797,19 +678,18 @@ if _COMFY_OPS_AVAILABLE:
                     bias_typed = bias.to(x.dtype) if bias is not None else None
                     y = F.linear(x_2d, w_float, bias_typed)
                 
-                # Dynamic LoRA Path
-                if self.lora_A is not None and self.lora_B is not None:
-                    # Ensure LoRA tensors are on the same device as x
-                    lA = self.lora_A.to(x.device, non_blocking=True)
-                    lB = self.lora_B.to(x.device, non_blocking=True)
-                    
-                    lora_x = F.linear(x_2d.to(lA.dtype), lA)
-                    lora_y = F.linear(lora_x, lB)
-                    
-                    if self.lora_alpha is not None:
-                        lora_y = lora_y * self.lora_alpha
-                    
-                    y = y + lora_y.to(y.dtype)
+                # Dynamic LoRA Path — handles split QKV via per-patch offsets
+                for lora_down, lora_up, lora_start, lora_size in self.lora_patches:
+                    lD = lora_down.to(x.device, non_blocking=True)
+                    lU = lora_up.to(x.device, non_blocking=True)
+                    lora_x = F.linear(x_2d.to(lD.dtype), lD)
+                    lora_y = F.linear(lora_x, lU)  # [batch, slice_size or full_out]
+                    if lora_start is not None:
+                        y[:, lora_start:lora_start + lora_size] = (
+                            y[:, lora_start:lora_start + lora_size] + lora_y.to(y.dtype)
+                        )
+                    else:
+                        y = y + lora_y.to(y.dtype)
                 
                 if need_cast:
                     uncast_bias_weight(self, weight, bias, offload_stream)
@@ -828,3 +708,103 @@ if _COMFY_OPS_AVAILABLE:
             if dims == 2: return cls.Conv2d(*args, **kwargs)
             elif dims == 3: return cls.Conv3d(*args, **kwargs)
             else: raise ValueError(f"unsupported dimensions: {dims}")
+
+# =============================================================================
+# INT8 Model Patcher - Unified LoRA Handling
+# =============================================================================
+
+class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
+    """
+    Custom ModelPatcher that intercepts patching for INT8 layers.
+    If a standard LoRA is applied, it uses the dynamic adder path.
+    If a specialized INT8 stochastic LoRA is applied, it uses the merged path.
+    """
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
+        if key not in self.patches:
+            return
+
+        # Check if this is one of our INT8 modules
+        module_path = key.rsplit('.', 1)[0]
+        try:
+            module = comfy.utils.get_attr(self.model, module_path)
+        except AttributeError:
+            module = None
+
+        is_int8_module = hasattr(module, "_is_quantized") and module._is_quantized
+        patches = self.patches[key]
+
+        # ComfyUI patch format: (strength_patch, adapter, strength_model, offset, function)
+        # Check if any patch is our specialized stochastic adapter (index 1 = adapter)
+        has_stochastic = any(
+            "INT8LoRAPatchAdapter" in str(type(p[1])) or "INT8MergedLoRAPatchAdapter" in str(type(p[1]))
+            for p in patches
+        )
+
+        if is_int8_module and not has_stochastic:
+            # --- DYNAMIC LORA PATH ---
+            # Build a list of (down_scaled, up, start, size) per patch.
+            # Keeping patches separate preserves the offset info needed for
+            # fused QKV layers where each of Q/K/V targets a different output slice.
+            weight = comfy.utils.get_attr(self.model, key)
+            device = weight.device if weight is not None else self.offload_device
+            lora_patches = []
+            for p in patches:
+                strength_patch = p[0]  # float
+                adapter = p[1]         # the LoRA adapter object
+                strength_model = p[2]  # float
+                offset = p[3] if len(p) > 3 else None  # (dim, start, size) or None
+
+                if not hasattr(adapter, "weights"):
+                    continue
+
+                strength = strength_patch * strength_model
+                weights = adapter.weights
+                # Standard LoRA: (up, down, alpha, mid, dora_scale, reshape)
+                if len(weights) == 6:
+                    up, down, alpha, mid, dora, reshape = weights
+                    rank = down.shape[0] if down.ndim >= 2 else 1
+                    scale = (alpha / rank) * strength if alpha is not None else strength
+
+                    down_scaled = down.flatten(1) * scale
+                    if mid is not None:
+                        down_scaled = torch.mm(mid.flatten(1), down.flatten(1)) * scale
+
+                    # If this layer has QuaRot applied, rotate the 'down' matrix
+                    # so the LoRA delta is coherent with the rotated weight basis:
+                    #   W_rot = W @ H^T  =>  ΔW_rot = ΔW @ H^T  =>  rotate down only
+                    if getattr(module, "_use_quarot", False) and down_scaled.shape[1] % QUAROT_GROUP_SIZE == 0:
+                        try:
+                            from .quarot import build_hadamard, rotate_weight
+                            group_size = getattr(module, "_quarot_groupsize", QUAROT_GROUP_SIZE)
+                            H = build_hadamard(group_size, device=down_scaled.device, dtype=down_scaled.dtype)
+                            down_scaled = rotate_weight(down_scaled, H, group_size=group_size)
+                        except ImportError:
+                            pass
+
+                    # Extract offset: which output rows this patch targets
+                    start, size = None, None
+                    if offset is not None:
+                        _dim, start, size = offset  # dim is always 0 for linear weights
+
+                    lora_patches.append((down_scaled.to(device), up.flatten(1).to(device), start, size))
+
+            module.lora_patches = lora_patches
+            return  # Skip standard weight-merging path
+
+        # --- STANDARD / STOCHASTIC PATH ---
+        return super().patch_weight_to_device(key, device_to, inplace_update)
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if unpatch_weights:
+            for name, module in self.model.named_modules():
+                if hasattr(module, "lora_patches"):
+                    module.lora_patches = []
+        return super().unpatch_model(device_to, unpatch_weights)
+
+    def clone(self, *args, **kwargs):
+        src_cls = self.__class__
+        self.__class__ = INT8ModelPatcher
+        n = super().clone(*args, **kwargs)
+        n.__class__ = INT8ModelPatcher
+        self.__class__ = src_cls
+        return n

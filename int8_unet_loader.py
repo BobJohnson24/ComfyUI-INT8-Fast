@@ -98,5 +98,9 @@ class UNetLoaderINTW8A8:
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
         model = load_diffusion_model(unet_path, model_options=model_options)
         
+        # Wrap in custom patcher for unified LoRA support
+        from .int8_quant import INT8ModelPatcher
+        model = INT8ModelPatcher.clone(model)
+        
         return (model,)
 
