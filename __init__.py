@@ -83,20 +83,18 @@ except ImportError:
 # Wrap imports in try/except to prevent total failure if dependencies are missing
 try:
     from .int8_unet_loader import UNetLoaderINTW8A8
-    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
+    from .int8_lora import INT8GroupedLora
     from .int8_save import INT8ModelSave
     
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
-        "INT8LoraLoader": INT8LoraLoader,
-        "INT8LoraLoaderStack": INT8LoraLoaderStack,
+        "INT8GroupedLora": INT8GroupedLora,
         "INT8ModelSave": INT8ModelSave,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
-        "INT8LoraLoader": "Load LoRA INT8 (Stochastic)",
-        "INT8LoraLoaderStack": "INT8 LoRA Stack (Stochastic)",
+        "INT8GroupedLora": "INT8 Grouped LoRA",
         "INT8ModelSave": "Save Int8 Model",
     }
 except ImportError as e:

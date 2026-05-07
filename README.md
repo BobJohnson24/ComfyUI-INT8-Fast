@@ -1,19 +1,7 @@
 # Comfy INT8 Acceleration
 
 This node speeds up Flux2, Chroma, Z-Image, Ernie Image in ComfyUI by using INT8 quantization, delivering between 1.5~2x faster inference on my 3090 depending on the model. It should work on any NVIDIA GPU with enough INT8 TOPS. It's unlikely to be faster than proper FP8 on 40-Series and above. 
-Works with lora*, torch compile (needed to get full speedup).
-
-*LoRAs need to be applied using one of the following methods:
-
-### Option 1: Included INT8 Stochastic LoRA Node (Recommended for Speed)
-- **Performance:** Faster inference
-- **Quality:** Possibly slightly lower quality
-- Use the included INT8 LoRA node
-
-### Option 2: Just use the regular comfy lora node
-- **Performance:** Depending on rank it can be anywhere from 1.1-1.4x slower due to dynamic calculations
-- **Quality:** Much higher quality than stochastic
-- I took this approach from city96/GGUF node.
+Works with lora, torch compile (needed to get full speedup).
 
 Pre-quantized checkpoints were recommended for most architectures, but on-the-fly quantization with QuaRot is better in all cases.
 However, QuaRot is also a little slower, so these prequantized models are still useful.

@@ -39,33 +39,7 @@ def quantize_int8_axiswise(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
 def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
     return q.float() * scale
 
-def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
-    """
-    Quantize a delta tensor to INT8 using stochastic rounding.
-    Used for LoRA deltas to minimize quantization error.
-    """
-    generator = torch.Generator(device=x.device)
-    generator.manual_seed(seed)
-    
-    # Scale to INT8 range — move scale to x's device to handle CPU-stored scales
-    if isinstance(scale, torch.Tensor):
-        scale = scale.to(x.device)
-    x_scaled = x / scale
-    
-    # Stochastic rounding
-    x_floor = torch.floor(x_scaled)
-    fraction = x_scaled - x_floor
-    del x_scaled # High-precision input no longer needed
-    
-    # Speed optimization: Create random values directly on the target device
-    random_vals = torch.rand(x_floor.shape, generator=generator, device=x.device, dtype=x_floor.dtype)
-    x_rounded = torch.where(random_vals < fraction, x_floor + 1, x_floor)
-    
-    del random_vals
-    del fraction
-    del x_floor
-    
-    return torch.clamp(x_rounded, -128, 127).to(torch.int8)
+
 
 
 # --- LinearW8A8 Core ---
@@ -131,268 +105,7 @@ def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor
 # INT8 LoRA Adapter - High Precision, Low RAM Patching
 # =============================================================================
 
-def reconstruct_lora_diff(weights, target_shape, device, dtype, strength):
-    """
-    Reconstructs the low-rank delta in high precision for different adapter types.
-    Supports LoRA, LoHA, and LoKR.
-    """
-    import comfy.model_management
-    
-    def cast(t):
-        return comfy.model_management.cast_to_device(t, device, dtype)
 
-    v = weights
-    # -------------------------------------------------------------------------
-    # Case 1: LoRA (used by LoRAAdapter)
-    # weights: (up, down, alpha, mid, dora_scale, reshape)
-    # -------------------------------------------------------------------------
-    if len(v) == 6:
-        up, down, alpha, mid, dora, reshape = v
-        up_f = cast(up)
-        down_f = cast(down)
-        rank = down.shape[0]
-        scale = (alpha / rank) * strength if alpha is not None else strength
-        
-        if mid is not None:
-            mid_f = cast(mid)
-            # LoCon/LoHA style Tucker: up @ mid @ down
-            lora_diff = torch.mm(up_f.flatten(1), torch.mm(mid_f.flatten(1), down_f.flatten(1)))
-        else:
-            lora_diff = torch.mm(up_f.flatten(1), down_f.flatten(1))
-            
-        return lora_diff.reshape(target_shape), scale
-
-    # -------------------------------------------------------------------------
-    # Case 2: LoHA (used by LoHAAdapter)
-    # weights: (w1a, w1b, alpha, w2a, w2b, t1, t2, dora_scale)
-    # -------------------------------------------------------------------------
-    elif len(v) == 8:
-        w1a, w1b, alpha, w2a, w2b, t1, t2, dora = v
-        rank = w1b.shape[0]
-        scale = (alpha / rank) * strength if alpha is not None else strength
-        
-        if t1 is not None:
-             m1 = torch.einsum("i j k l, j r, i p -> p r k l", cast(t1), cast(w1b), cast(w1a))
-             m2 = torch.einsum("i j k l, j r, i p -> p r k l", cast(t2), cast(w2b), cast(w2a))
-        else:
-             m1 = torch.mm(cast(w1a), cast(w1b))
-             m2 = torch.mm(cast(w2a), cast(w2b))
-        
-        lora_diff = (m1 * m2)
-        return lora_diff.reshape(target_shape), scale
-
-    # -------------------------------------------------------------------------
-    # Case 3: LoKR (used by LoKrAdapter)
-    # weights: (w1, w2, alpha, w1a, w1b, w2a, w2b, t2, dora_scale)
-    # -------------------------------------------------------------------------
-    elif len(v) == 9:
-        w1, w2, alpha, w1a, w1b, w2a, w2b, t2, dora = v
-        dim = None
-        
-        if w1 is None:
-            dim = w1b.shape[0]
-            w1_f = torch.mm(cast(w1a), cast(w1b))
-        else:
-            w1_f = cast(w1)
-            
-        if w2 is None:
-            dim = w2b.shape[0]
-            if t2 is None:
-                w2_f = torch.mm(cast(w2a), cast(w2b))
-            else:
-                w2_f = torch.einsum("i j k l, j r, i p -> p r k l", cast(t2), cast(w2b), cast(w2a))
-        else:
-            w2_f = cast(w2)
-            
-        if len(w2_f.shape) == 4:
-            w1_f = w1_f.unsqueeze(2).unsqueeze(2)
-            
-        scale = (alpha / dim) * strength if (alpha is not None and dim is not None) else strength
-        lora_diff = torch.kron(w1_f, w2_f)
-        return lora_diff.reshape(target_shape), scale
-
-    return None, 1.0
-
-
-try:
-    from comfy.weight_adapter.lora import LoRAAdapter
-    _LORA_ADAPTER_AVAILABLE = True
-except ImportError:
-    _LORA_ADAPTER_AVAILABLE = False
-
-if _LORA_ADAPTER_AVAILABLE:
-    class INT8LoRAPatchAdapter(LoRAAdapter):
-        """
-        Specialized LoRA adapter that patches INT8 weights IN-PLACE in INT8 space.
-        """
-        def __init__(self, loaded_keys, weights, weight_scale, seed=0):
-            super().__init__(loaded_keys, weights)
-            self.weight_scale = weight_scale
-            self.seed = seed
-
-
-        def _get_effective_scale(self, delta_f, offset):
-            """Slice weight_scale to match delta_f when dealing with merged QKV LoRAs.
-            
-            ComfyUI narrows the full weight to a Q/K/V slice before calling us,
-            but weight_scale is still the full merged tensor, so we need to match it.
-            """
-            ws = self.weight_scale
-            if not isinstance(ws, torch.Tensor) or ws.numel() == 1:
-                return ws  # scalar – always fine
-            
-            # offset = (dim, start, size) as set by ComfyUI for merged QKV layers
-            if offset is not None:
-                dim, start, size = offset
-                if dim < ws.dim() and ws.shape[dim] > start:
-                    # Double check if size matches, or if we can safely narrow
-                    narrow_size = min(size, ws.shape[dim] - start)
-                    return ws.narrow(dim, start, narrow_size)
-            
-            # No offset, but still mismatched (e.g. separate-weight LoRA vs merged model):
-            # try to detect which chunk by matching row count
-            if ws.shape[0] != delta_f.shape[0] and ws.shape[0] % delta_f.shape[0] == 0:
-                return ws[: delta_f.shape[0]]
-                
-            return ws
-
-        def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
-            if intermediate_dtype == torch.int8:
-                intermediate_dtype = torch.float32
-                
-            # Compute LoRA Delta in high-precision. 
-            # Respect ComfyUI's device selection for computation.
-            device = weight.device
-            import comfy.model_management
-            comp_device = comfy.model_management.get_torch_device()
-            
-            # Unified reconstruction for LoRA, LoHA, LoKR
-            lora_diff, scale = reconstruct_lora_diff(
-                self.weights, weight.shape, comp_device, intermediate_dtype, strength
-            )
-            
-            if lora_diff is None:
-                return weight
-            
-            # Apply Patch
-            if weight.dtype == torch.int8:
-                # --- INT8 SPACE PATCHING ---
-                delta_f = lora_diff * scale
-                del lora_diff # Free memory immediately
-
-                # If QuaRot was applied to this layer's weights, rotate the delta into the same
-                # basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
-                group_size = getattr(Int8TensorwiseOps, '_global_quarot_groupsize', QUAROT_GROUP_SIZE)
-                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % group_size == 0:
-                    try:
-                        from .quarot import build_hadamard, rotate_weight
-                        H = build_hadamard(group_size, device=comp_device, dtype=delta_f.dtype)
-                        delta_f = rotate_weight(delta_f, H, group_size=group_size)
-                    except ImportError:
-                        pass
-
-                eff_scale = self._get_effective_scale(delta_f, offset)
-                delta_int8 = stochastic_round_int8_delta(delta_f, eff_scale, self.seed)
-                del delta_f # Free high-precision delta
-                
-                # Perform integer addition (int32 for safety) then clamp
-                res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
-                del delta_int8 # Free temporary INT8 delta
-                
-                final_weight = torch.clamp(res, -128, 127).to(torch.int8).to(device)
-                del res
-                return final_weight
-            else:
-                # Fallback: Standard Float Patching
-                final_weight = weight + (lora_diff * scale).to(weight.device, weight.dtype)
-                del lora_diff
-                return final_weight
-
-    class INT8MergedLoRAPatchAdapter(LoRAAdapter):
-        """
-        Adapter that merges multiple LoRAs in float space BEFORE applying a single
-        stochastic rounding step. This is much more precise for LoRA stacks.
-        """
-        def __init__(self, patches, weight_scale, seed=0):
-            # We need to satisfy the base LoRAAdapter constructor.
-            # We use the first patch's keys/weights as a reference.
-            first_patch_adapter = patches[0][0]
-            super().__init__(first_patch_adapter.loaded_keys, first_patch_adapter.weights)
-            
-            # patches is a list of (adapter, strength)
-            self.patches = patches
-            self.weight_scale = weight_scale
-            self.seed = seed
-
-        def _get_effective_scale(self, delta_f, offset):
-            """Same slice-logic as INT8LoRAPatchAdapter._get_effective_scale."""
-            ws = self.weight_scale
-            if not isinstance(ws, torch.Tensor) or ws.numel() == 1:
-                return ws
-            if offset is not None and ws.shape[0] != delta_f.shape[0]:
-                dim, start, size = offset
-                if dim == 0:
-                    return ws.narrow(0, start, size)
-            if ws.shape[0] != delta_f.shape[0] and ws.shape[0] % delta_f.shape[0] == 0:
-                return ws[: delta_f.shape[0]]
-            return ws
-
-        def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
-            if intermediate_dtype == torch.int8:
-                intermediate_dtype = torch.float32
-                
-            # Note: 'strength' from ComfyUI is ignored here as we use internal lora_strengths
-            device = weight.device
-            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
-            
-            total_delta_f = None
-            
-            for adapter, lora_strength in self.patches:
-                # Unified reconstruction for each adapter in the stack
-                delta, scale = reconstruct_lora_diff(
-                    adapter.weights, weight.shape, comp_device, intermediate_dtype, lora_strength
-                )
-                
-                if delta is None: continue
-                
-                if total_delta_f is None:
-                    total_delta_f = delta * scale
-                else:
-                    total_delta_f += delta * scale
-                
-                del delta # Free high-precision intermediate
-            
-            if total_delta_f is None:
-                return weight
-
-            if weight.dtype == torch.int8:
-                # One single stochastic rounding step for all combined LoRAs
-
-                # If QuaRot was applied to this layer's weights, rotate the combined delta into
-                # the same basis (ΔW @ H^T) so the update is coherent: W_rot + ΔW_rot = (W + ΔW) @ H^T
-                group_size = getattr(Int8TensorwiseOps, '_global_quarot_groupsize', QUAROT_GROUP_SIZE)
-                if getattr(Int8TensorwiseOps, 'enable_quarot', False) and weight.shape[1] % group_size == 0:
-                    try:
-                        from .quarot import build_hadamard, rotate_weight
-                        H = build_hadamard(group_size, device=comp_device, dtype=total_delta_f.dtype)
-                        total_delta_f = rotate_weight(total_delta_f, H, group_size=group_size)
-                    except ImportError:
-                        pass
-
-                eff_scale = self._get_effective_scale(total_delta_f, offset)
-                delta_int8 = stochastic_round_int8_delta(total_delta_f, eff_scale, self.seed)
-                del total_delta_f # Free combined high-precision delta
-                
-                res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
-                del delta_int8 # Free temporary INT8 delta
-                
-                final_weight = torch.clamp(res, -128, 127).to(torch.int8).to(device)
-                del res
-                return final_weight
-            else:
-                final_weight = weight + total_delta_f.to(device, weight.dtype)
-                del total_delta_f
-                return final_weight
 
 
 # =============================================================================
@@ -416,6 +129,7 @@ if _COMFY_OPS_AVAILABLE:
         enable_quarot = False # Toggle for QuaRot Hadamard rotation
         use_triton = True  # Toggle for Triton fused kernel (mirrors _use_triton)
         _is_prequantized = False # Keep this as a status flag, but don't use for detection
+        dynamic_lora = False # If True, apply LoRA dynamically at inference; if False, bake into INT8 weights at load time
         
         class Linear(manual_cast.Linear):
             def __init__(self, *args, **kwargs):
@@ -594,8 +308,7 @@ if _COMFY_OPS_AVAILABLE:
                     return
 
                 # Re-quantize if fallback occurred
-                from .int8_quant import stochastic_round_int8_delta
-                new_weight = stochastic_round_int8_delta(out_weight, self._get_weight_scale(), seed)
+                new_weight = quantize_int8(out_weight, self._get_weight_scale())
                 
                 if return_weight:
                     return new_weight
@@ -716,8 +429,8 @@ if _COMFY_OPS_AVAILABLE:
 class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
     """
     Custom ModelPatcher that intercepts patching for INT8 layers.
-    If a standard LoRA is applied, it uses the dynamic adder path.
-    If a specialized INT8 stochastic LoRA is applied, it uses the merged path.
+    Routes patching through either a bake-in path (dequant-patch-requant)
+    or a dynamic path (runtime injection), depending on the dynamic_lora toggle.
     """
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
         if key not in self.patches:
@@ -733,65 +446,125 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
         is_int8_module = hasattr(module, "_is_quantized") and module._is_quantized
         patches = self.patches[key]
 
-        # ComfyUI patch format: (strength_patch, adapter, strength_model, offset, function)
-        # Check if any patch is our specialized stochastic adapter (index 1 = adapter)
-        has_stochastic = any(
-            "INT8LoRAPatchAdapter" in str(type(p[1])) or "INT8MergedLoRAPatchAdapter" in str(type(p[1]))
-            for p in patches
-        )
 
-        if is_int8_module and not has_stochastic:
-            # --- DYNAMIC LORA PATH ---
-            # Build a list of (down_scaled, up, start, size) per patch.
-            # Keeping patches separate preserves the offset info needed for
-            # fused QKV layers where each of Q/K/V targets a different output slice.
-            weight = comfy.utils.get_attr(self.model, key)
-            device = weight.device if weight is not None else self.offload_device
-            lora_patches = []
-            for p in patches:
-                strength_patch = p[0]  # float
-                adapter = p[1]         # the LoRA adapter object
-                strength_model = p[2]  # float
-                offset = p[3] if len(p) > 3 else None  # (dim, start, size) or None
 
-                if not hasattr(adapter, "weights"):
-                    continue
+        if is_int8_module:
+            if not Int8TensorwiseOps.dynamic_lora:
+                # --- BAKE-IN LORA PATH (Dequant → Patch → Quant) ---
+                # Works with the native ComfyUI LoRA Loader (and also INT8LoraLoader).
+                # All patches are applied in float space via ComfyUI's standard mechanism,
+                # then the result is re-quantized back to INT8.
 
-                strength = strength_patch * strength_model
-                weights = adapter.weights
-                # Standard LoRA: (up, down, alpha, mid, dora_scale, reshape)
-                if len(weights) == 6:
-                    up, down, alpha, mid, dora, reshape = weights
-                    rank = down.shape[0] if down.ndim >= 2 else 1
-                    scale = (alpha / rank) * strength if alpha is not None else strength
+                weight_int8 = comfy.utils.get_attr(self.model, key)
+                scale = module._get_weight_scale()
 
-                    down_scaled = down.flatten(1) * scale
-                    if mid is not None:
-                        down_scaled = torch.mm(mid.flatten(1), down.flatten(1)) * scale
+                if device_to is None:
+                    device_to = weight_int8.device
 
-                    # If this layer has QuaRot applied, rotate the 'down' matrix
-                    # so the LoRA delta is coherent with the rotated weight basis:
-                    #   W_rot = W @ H^T  =>  ΔW_rot = ΔW @ H^T  =>  rotate down only
-                    if getattr(module, "_use_quarot", False) and down_scaled.shape[1] % QUAROT_GROUP_SIZE == 0:
-                        try:
-                            from .quarot import build_hadamard, rotate_weight
-                            group_size = getattr(module, "_quarot_groupsize", QUAROT_GROUP_SIZE)
-                            H = build_hadamard(group_size, device=down_scaled.device, dtype=down_scaled.dtype)
-                            down_scaled = rotate_weight(down_scaled, H, group_size=group_size)
-                        except ImportError:
-                            pass
+                # Save original weight so unpatch_model can restore it.
+                # Must use the same namedtuple format as ComfyUI's base patcher
+                # (collections.namedtuple('Dimension', ['weight', 'inplace_update']))
+                # otherwise unpatch_model crashes with AttributeError on bk.inplace_update.
+                if key not in self.backup:
+                    import collections
+                    BackupEntry = collections.namedtuple('Dimension', ['weight', 'inplace_update'])
+                    self.backup[key] = BackupEntry(
+                        weight=weight_int8.to(device=self.offload_device, copy=inplace_update),
+                        inplace_update=inplace_update,
+                    )
 
-                    # Extract offset: which output rows this patch targets
-                    start, size = None, None
-                    if offset is not None:
-                        _dim, start, size = offset  # dim is always 0 for linear weights
+                # 1. Dequantize to float (move scale to device_to since it lives on CPU)
+                if isinstance(scale, torch.Tensor):
+                    scale = scale.to(device_to)
+                weight_float = dequantize(weight_int8.to(device_to), scale)
 
-                    lora_patches.append((down_scaled.to(device), up.flatten(1).to(device), start, size))
+                # 2. Handle QuaRot: de-rotate into weight space before patching
+                use_quarot = getattr(module, "_use_quarot", False)
+                if use_quarot:
+                    group_size = getattr(module, "_quarot_groupsize", QUAROT_GROUP_SIZE)
+                    try:
+                        from .quarot import build_hadamard, rotate_weight
+                        H = build_hadamard(group_size, device=device_to, dtype=weight_float.dtype)
+                        weight_float = rotate_weight(weight_float, H, group_size=group_size)
+                    except ImportError:
+                        pass
 
-            module.lora_patches = lora_patches
-            return  # Skip standard weight-merging path
+                # 3. Patch in float space using ComfyUI's standard mechanism.
+                # calculate_weight handles LoRA, LoHA, LoKR, DoRA, etc.
+                patches_list = self.patches.get(key, [])
+                patched_weight_float = comfy.lora.calculate_weight(patches_list, weight_float, key)
 
-        # --- STANDARD / STOCHASTIC PATH ---
+                # 4. Handle QuaRot: re-rotate
+                if use_quarot:
+                    patched_weight_float = rotate_weight(patched_weight_float, H, group_size=group_size)
+
+                # 5. Re-quantize back to INT8 using the original scale
+                patched_weight_int8 = quantize_int8(patched_weight_float, scale)
+
+                # 6. Move back to original device and store
+                patched_weight_int8 = patched_weight_int8.to(weight_int8.device)
+
+                if return_weight:
+                    return patched_weight_int8
+
+                if inplace_update:
+                    weight_int8.data.copy_(patched_weight_int8)
+                else:
+                    comfy.utils.set_attr(self.model, key, nn.Parameter(patched_weight_int8, requires_grad=False))
+                return
+
+            else:
+                # --- DYNAMIC LORA PATH ---
+                # Build a list of (down_scaled, up, start, size) per patch.
+                # Keeping patches separate preserves the offset info needed for
+                # fused QKV layers where each of Q/K/V targets a different output slice.
+                weight = comfy.utils.get_attr(self.model, key)
+                device = weight.device if weight is not None else self.offload_device
+                lora_patches = []
+                for p in patches:
+                    strength_patch = p[0]  # float
+                    adapter = p[1]         # the LoRA adapter object
+                    strength_model = p[2]  # float
+                    offset = p[3] if len(p) > 3 else None  # (dim, start, size) or None
+
+                    if not hasattr(adapter, "weights"):
+                        continue
+
+                    strength = strength_patch * strength_model
+                    weights = adapter.weights
+                    # Standard LoRA: (up, down, alpha, mid, dora_scale, reshape)
+                    if len(weights) == 6:
+                        up, down, alpha, mid, dora, reshape = weights
+                        rank = down.shape[0] if down.ndim >= 2 else 1
+                        scale = (alpha / rank) * strength if alpha is not None else strength
+
+                        down_scaled = down.flatten(1) * scale
+                        if mid is not None:
+                            down_scaled = torch.mm(mid.flatten(1), down.flatten(1)) * scale
+
+                        # If this layer has QuaRot applied, rotate the 'down' matrix
+                        # so the LoRA delta is coherent with the rotated weight basis:
+                        #   W_rot = W @ H^T  =>  ΔW_rot = ΔW @ H^T  =>  rotate down only
+                        if getattr(module, "_use_quarot", False) and down_scaled.shape[1] % QUAROT_GROUP_SIZE == 0:
+                            try:
+                                from .quarot import build_hadamard, rotate_weight
+                                group_size = getattr(module, "_quarot_groupsize", QUAROT_GROUP_SIZE)
+                                H = build_hadamard(group_size, device=down_scaled.device, dtype=down_scaled.dtype)
+                                down_scaled = rotate_weight(down_scaled, H, group_size=group_size)
+                            except ImportError:
+                                pass
+
+                        # Extract offset: which output rows this patch targets
+                        start, size = None, None
+                        if offset is not None:
+                            _dim, start, size = offset  # dim is always 0 for linear weights
+
+                        lora_patches.append((down_scaled.to(device), up.flatten(1).to(device), start, size))
+
+                module.lora_patches = lora_patches
+                return  # Skip standard weight-merging path
+
+        # --- NON-INT8 MODULE PATH ---
         return super().patch_weight_to_device(key, device_to, inplace_update)
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
