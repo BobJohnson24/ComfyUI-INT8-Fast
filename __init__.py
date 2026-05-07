@@ -4,7 +4,6 @@ INT8 Fast - INT8 Tensorwise Quantization for ComfyUI
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
 - OTUNetLoaderW8A8: Load int8 quantized diffusion models
-- OTCheckpointLoaderW8A8: Load int8 quantized checkpoints
 
 Uses torch._int_mm for fast inference.
 """
@@ -84,23 +83,19 @@ except ImportError:
 # Wrap imports in try/except to prevent total failure if dependencies are missing
 try:
     from .int8_unet_loader import UNetLoaderINTW8A8
-    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
-    from .int8_dynamic_lora import INT8DynamicLoraLoader, INT8DynamicLoraStack
+    from .int8_lora import INT8GroupedLora
+    from .int8_save import INT8ModelSave
     
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
-        "INT8LoraLoader": INT8LoraLoader,
-        "INT8LoraLoaderStack": INT8LoraLoaderStack,
-        "INT8DynamicLoraLoader": INT8DynamicLoraLoader,
-        "INT8DynamicLoraStack": INT8DynamicLoraStack,
+        "INT8GroupedLora": INT8GroupedLora,
+        "INT8ModelSave": INT8ModelSave,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
-        "INT8LoraLoader": "Load LoRA INT8 (Stochastic)",
-        "INT8LoraLoaderStack": "INT8 LoRA Stack (Stochastic)",
-        "INT8DynamicLoraLoader": "Load LoRA INT8 (Dynamic)",
-        "INT8DynamicLoraStack": "INT8 LoRA Stack (Dynamic)",
+        "INT8GroupedLora": "INT8 Grouped LoRA",
+        "INT8ModelSave": "Save Int8 Model",
     }
 except ImportError as e:
     logging.error(f"Int88: Failed to import nodes: {e}")

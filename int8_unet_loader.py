@@ -24,6 +24,7 @@ class UNetLoaderINTW8A8:
                 "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima"],),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False}),
                 "enable_quarot": ("BOOLEAN", {"default": False, "tooltip": "Enable QuaRot (Hadamard rotation) for better quantization."}),
+                "dynamic_lora": ("BOOLEAN", {"default": False, "tooltip": "Dynamic LoRA: apply LoRA at inference time (requires INT8LoraLoader). When OFF, LoRA is baked into INT8 weights at load time — the native ComfyUI LoRA Loader works directly."}),
                 #"enable_triton": ("BOOLEAN", {"default": True, "tooltip": "Use the Triton fused INT8 kernel. Disable to fall back to torch._int_mm (useful for debugging or unsupported GPUs)."}),
             }
         }
@@ -33,7 +34,7 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_quarot=False):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_quarot=False, dynamic_lora=False):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
         # Use Int8TensorwiseOps for proper direct int8 loading
@@ -49,11 +50,14 @@ class UNetLoaderINTW8A8:
         Int8TensorwiseOps.enable_quarot = enable_quarot
         Int8TensorwiseOps.use_triton = True
         Int8TensorwiseOps._is_prequantized = False
+        Int8TensorwiseOps.dynamic_lora = dynamic_lora
+        if hasattr(Int8TensorwiseOps, "_logged_otf"):
+            delattr(Int8TensorwiseOps, "_logged_otf")
         
         # Check explicit model_type for exclusions
         if model_type == "flux2":
             Int8TensorwiseOps.excluded_names = [
-                'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer', 
+                'img_in', 'time_in', 'guidance_in', 'txt_in', 
                 'double_stream_modulation_img', 'double_stream_modulation_txt', 
                 'single_stream_modulation',
             ]
@@ -74,11 +78,11 @@ class UNetLoaderINTW8A8:
             ]
         elif model_type == "ernie":
             Int8TensorwiseOps.excluded_names = [
-                'time', 'x_embedder', 'adaLN', 'final', 'text_proj', 'norm', 'layers.0.', 'layers.35',
+                'time', 'x_embedder', 'text_proj', 'adaLN',
             ]
         elif model_type == "anima":
             Int8TensorwiseOps.excluded_names = [
-                'embed', 'llm', 'blocks.0.', 'blocks.1.', 'blocks.2.',
+                'embed', 'llm', 'adaln',
             ]
         elif model_type == "wan":
             Int8TensorwiseOps.excluded_names = [
@@ -95,6 +99,10 @@ class UNetLoaderINTW8A8:
 
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
         model = load_diffusion_model(unet_path, model_options=model_options)
+        
+        # Wrap in custom patcher for unified LoRA support
+        from .int8_quant import INT8ModelPatcher
+        model = INT8ModelPatcher.clone(model)
         
         return (model,)
 
