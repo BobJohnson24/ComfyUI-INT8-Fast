@@ -262,7 +262,9 @@ if _COMFY_OPS_AVAILABLE:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
                         # Load Quantized
                         self._is_quantized = True
-                        self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        
+                        # Always clone to ensure it's not mmapped (needed for pinning)
+                        self.weight = nn.Parameter(weight_tensor.clone(), requires_grad=False)
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
                         
                         if isinstance(weight_scale, torch.Tensor):
@@ -291,7 +293,9 @@ if _COMFY_OPS_AVAILABLE:
                         
                         if is_excluded or is_dim1 or not Int8TensorwiseOps.dynamic_quantize:
                             self._is_quantized = False
-                            self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                            
+                            # Always clone to ensure it's not mmapped (needed for pinning)
+                            self.weight = nn.Parameter(weight_tensor.clone(), requires_grad=False)
                         else:
                             # Quantize on the fly
                             device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
@@ -325,13 +329,16 @@ if _COMFY_OPS_AVAILABLE:
                             self._is_per_row = True
                     else:
                         self._is_quantized = False
-                        self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        
+                        # Always clone to ensure it's not mmapped (needed for pinning)
+                        self.weight = nn.Parameter(weight_tensor.clone(), requires_grad=False)
                 else:
                     missing_keys.append(weight_key)
                 
                 # Assign bias if it exists (already patched if needed)
                 if bias_tensor is not None:
-                    self.bias = nn.Parameter(bias_tensor, requires_grad=False)
+                    # Always clone to ensure it's not mmapped (needed for pinning)
+                    self.bias = nn.Parameter(bias_tensor.clone(), requires_grad=False)
                 else:
                     self.bias = None
 
@@ -482,12 +489,75 @@ if _COMFY_OPS_AVAILABLE:
                 return y.reshape(*x_shape[:-1], y.shape[-1])
         
         # Pass-through for other layers
-        class GroupNorm(manual_cast.GroupNorm): pass
-        class LayerNorm(manual_cast.LayerNorm): pass
-        class Conv2d(manual_cast.Conv2d): pass
-        class Conv3d(manual_cast.Conv3d): pass
-        class ConvTranspose2d(manual_cast.ConvTranspose2d): pass
-        class Embedding(manual_cast.Embedding): pass
+        class RMSNorm(manual_cast.RMSNorm):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+        class GroupNorm(manual_cast.GroupNorm):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+        class LayerNorm(manual_cast.LayerNorm):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+        class Conv2d(manual_cast.Conv2d):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+        class Conv3d(manual_cast.Conv3d):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+        class ConvTranspose2d(manual_cast.ConvTranspose2d):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+        class Embedding(manual_cast.Embedding):
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                for k in ["weight", "bias"]:
+                    key = prefix + k
+                    if key in state_dict:
+                        v = state_dict[key]
+                        if v is not None:
+                            state_dict[key] = v.clone()
+                return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
         
         @classmethod
         def conv_nd(cls, dims, *args, **kwargs):
