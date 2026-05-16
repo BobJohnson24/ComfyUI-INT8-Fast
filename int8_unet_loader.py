@@ -30,6 +30,7 @@ class UNetLoaderINTW8A8:
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize a higher precision model to INT8. If the selected model is already INT8 keep unchecked."}),
                 "enable_convrot": ("BOOLEAN", {"default": True, "tooltip": "Enable ConvRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
                 "lora_mode": (["None", "Stochastic", "Dynamic"], {"default": "None", "tooltip": "None bakes LoRA patches with normal rounding which is the default behavior. Stochastic bakes with stochastic INT8 rounding, which can occasionally be closer to the BF16+lora baseline. Dynamic applies LoRA at inference time, which is slow and only works for conventional lora."}),
+                "debug_load": ("BOOLEAN", {"default": False, "tooltip": "Print verbose INT8 checkpoint diagnostics while loading: comfy_quant, ConvRot, group size, int8 scales, tensor shapes, and fallback paths."}),
             },
             "optional": {
                 "pre_lora": ("PRE_LORA",),
@@ -41,7 +42,7 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load and Quantize INT8 models with fast triton inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", pre_lora=None):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", debug_load=False, pre_lora=None):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
 
         # Backward compatibility for workflows saved with the old dynamic_lora boolean widget.
@@ -71,6 +72,13 @@ class UNetLoaderINTW8A8:
         Int8TensorwiseOps.lora_mode = lora_mode
         Int8TensorwiseOps.dynamic_lora = lora_mode == "Dynamic"
         Int8TensorwiseOps.dynamic_load_device = None
+        Int8TensorwiseOps.debug_load = bool(debug_load)
+        Int8TensorwiseOps._reset_debug()
+        Int8TensorwiseOps._debug(
+            f"loader settings: unet={unet_name!r}, dtype={weight_dtype}, model_type={model_type}, "
+            f"on_the_fly={on_the_fly_quantization}, enable_convrot={enable_convrot}, "
+            f"lora_mode={lora_mode}, triton={Int8TensorwiseOps.use_triton}"
+        )
         if comfy.memory_management.aimdo_enabled and (on_the_fly_quantization or len(loras_to_load) > 0):
             Int8TensorwiseOps.dynamic_load_device = comfy.model_management.get_torch_device()
             logging.info(f"INT8 Fast: Aimdo dynamic loading active, using {Int8TensorwiseOps.dynamic_load_device} as a per-layer bake/quant work device.")
@@ -123,6 +131,10 @@ class UNetLoaderINTW8A8:
 
         # Load state dict once to detect model and prepare LoRA
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+        Int8TensorwiseOps._debug(
+            f"checkpoint loaded: path={unet_path!r}, tensors={len(sd)}, "
+            f"metadata_keys={sorted(metadata.keys()) if isinstance(metadata, dict) else type(metadata).__name__}"
+        )
         
         # Pre-load LoRA if selected to bake it during quantization
         Int8TensorwiseOps.lora_patches = {}
@@ -198,6 +210,7 @@ class UNetLoaderINTW8A8:
         try:
             Int8TensorwiseOps.applied_lora_patches = set()
             model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
+            Int8TensorwiseOps._debug_summary()
             
             # Print unmatched keys to help with debugging
             if Int8TensorwiseOps.lora_patches:
@@ -209,6 +222,10 @@ class UNetLoaderINTW8A8:
                 else:
                     action = "scheduled for deferred baking" if Int8TensorwiseOps.dynamic_load_device is not None else "successfully baked"
                     #print(f"INT8 Fast: All {len(Int8TensorwiseOps.lora_patches)} LoRA keys {action}!")
+        except Exception as e:
+            Int8TensorwiseOps._debug(f"load failed: {type(e).__name__}: {e}", force=True)
+            Int8TensorwiseOps._debug_summary()
+            raise
         finally:
             # Always clear patches after load to avoid sticking
             dynamic_load_device = Int8TensorwiseOps.dynamic_load_device

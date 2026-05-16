@@ -2,6 +2,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 import logging
+import os
 import comfy.model_patcher
 import comfy.memory_management
 import comfy.model_management
@@ -155,6 +156,146 @@ if _COMFY_OPS_AVAILABLE:
         lora_strength = 1.0
         dynamic_load_device = None # Set by the loader when Aimdo should avoid a full CPU staging copy
         skeleton_meta_init = False # Temporary mode for LoRA key-map discovery
+        debug_load = False
+        _debug_layer_print_limit = 80
+        _debug_layer_printed = 0
+        _debug_stats = {}
+
+        @classmethod
+        def _debug_enabled(cls):
+            env_value = os.environ.get("INT8_FAST_DEBUG", "").lower()
+            return cls.debug_load or env_value in {"1", "true", "yes", "on"}
+
+        @classmethod
+        def _reset_debug(cls):
+            cls._debug_layer_printed = 0
+            cls._debug_stats = {
+                "layers_seen": 0,
+                "prequantized": 0,
+                "otf_quantized": 0,
+                "fp_loaded": 0,
+                "missing_weight": 0,
+                "missing_scale_for_int8": 0,
+                "comfy_quant": 0,
+                "comfy_quant_errors": 0,
+                "convrot_layers": 0,
+                "convrot_warnings": 0,
+                "scale_warnings": 0,
+                "input_scale": 0,
+            }
+
+        @classmethod
+        def _count(cls, key, amount=1):
+            cls._debug_stats[key] = cls._debug_stats.get(key, 0) + amount
+
+        @classmethod
+        def _debug(cls, message, force=False):
+            if cls._debug_enabled() or force:
+                print(f"INT8 Fast Debug: {message}")
+
+        @classmethod
+        def _tensor_info(cls, tensor, include_stats=False):
+            if tensor is None:
+                return "None"
+            if not isinstance(tensor, torch.Tensor):
+                return f"{type(tensor).__name__}({tensor!r})"
+            info = (
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"device={tensor.device} numel={tensor.numel()} "
+                f"ndim={tensor.dim()} contiguous={tensor.is_contiguous()}"
+            )
+            if include_stats and tensor.numel() > 0 and not tensor.is_meta:
+                try:
+                    sample = tensor.detach().float()
+                    finite = torch.isfinite(sample)
+                    finite_count = int(finite.sum().item())
+                    info += (
+                        f" finite={finite_count}/{sample.numel()}"
+                        f" min={sample.min().item():.8g}"
+                        f" max={sample.max().item():.8g}"
+                        f" zeros={int((sample == 0).sum().item())}"
+                        f" <=0={int((sample <= 0).sum().item())}"
+                    )
+                except Exception as e:
+                    info += f" stats_error={type(e).__name__}: {e}"
+            return info
+
+        @classmethod
+        def _scale_warnings(cls, scale, out_features):
+            warnings = []
+            if scale is None:
+                return ["missing weight_scale"]
+            if isinstance(scale, torch.Tensor):
+                if scale.numel() == 0:
+                    warnings.append("weight_scale is empty")
+                    return warnings
+                if scale.numel() not in {1, out_features}:
+                    warnings.append(
+                        f"weight_scale numel {scale.numel()} does not match scalar or out_features {out_features}"
+                    )
+                if scale.numel() == out_features and not (
+                    scale.dim() == 2 and scale.shape[1] == 1
+                ):
+                    warnings.append(
+                        f"per-row weight_scale is shape {tuple(scale.shape)}, expected ({out_features}, 1)"
+                    )
+                try:
+                    sample = scale.detach().float()
+                    if not torch.isfinite(sample).all():
+                        warnings.append("weight_scale has NaN or Inf")
+                    if (sample <= 0).any():
+                        warnings.append("weight_scale has zero or negative values")
+                except Exception as e:
+                    warnings.append(f"could not inspect weight_scale values: {type(e).__name__}: {e}")
+            else:
+                try:
+                    if float(scale) <= 0:
+                        warnings.append("scalar weight_scale is zero or negative")
+                except Exception as e:
+                    warnings.append(f"could not parse scalar weight_scale: {type(e).__name__}: {e}")
+            return warnings
+
+        @classmethod
+        def _convrot_warnings(cls, group_size, in_features):
+            warnings = []
+            try:
+                group_size = int(group_size)
+            except Exception:
+                return [f"convrot_groupsize is not an int: {group_size!r}"]
+            if group_size <= 0:
+                warnings.append(f"convrot_groupsize must be > 0, got {group_size}")
+                return warnings
+            if group_size < 4 or (group_size & (group_size - 1)) != 0:
+                warnings.append(f"convrot_groupsize {group_size} is not a valid Hadamard power-of-two size")
+            else:
+                import math
+                if math.log(group_size, 4) % 1 != 0:
+                    warnings.append(f"convrot_groupsize {group_size} is not a power of 4")
+            if in_features % group_size != 0:
+                warnings.append(f"in_features {in_features} is not divisible by convrot_groupsize {group_size}")
+            return warnings
+
+        @classmethod
+        def _debug_layer(cls, prefix, message, force=False):
+            if not (cls._debug_enabled() or force):
+                return
+            if force or cls._debug_layer_printed < cls._debug_layer_print_limit:
+                cls._debug(f"{prefix or '<root>'}: {message}", force=force)
+                if not force:
+                    cls._debug_layer_printed += 1
+            elif cls._debug_layer_printed == cls._debug_layer_print_limit:
+                cls._debug(
+                    f"suppressing additional per-layer load lines after {cls._debug_layer_print_limit}; "
+                    "anomalies and final summary will still print"
+                )
+                cls._debug_layer_printed += 1
+
+        @classmethod
+        def _debug_summary(cls):
+            if not cls._debug_enabled():
+                return
+            stats = ", ".join(f"{k}={v}" for k, v in sorted(cls._debug_stats.items()))
+            cls._debug(f"load summary: {stats}")
         
         class Linear(manual_cast.Linear):
             def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
@@ -276,6 +417,8 @@ if _COMFY_OPS_AVAILABLE:
             
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
                 weight_key = prefix + "weight"
+                self._debug_prefix = prefix
+                Int8TensorwiseOps._count("layers_seen")
                 
                 # Utility to normalize keys by stripping common prefixes
                 def normalize_key(key):
@@ -311,7 +454,6 @@ if _COMFY_OPS_AVAILABLE:
                         return tensor.cpu()
                     return tensor
 
-                scale_key = prefix + "weight_scale"
                 input_scale_key = prefix + "input_scale"
                 bias_key = prefix + "bias"
                 
@@ -335,20 +477,37 @@ if _COMFY_OPS_AVAILABLE:
                 bias_tensor = state_dict.pop(bias_key, None)
 
                 # Pop input_scale to clean state_dict, but ignore it
-                _ = state_dict.pop(input_scale_key, None)
+                input_scale = pop_metadata(state_dict, prefix, "input_scale")
+                if input_scale is not None:
+                    Int8TensorwiseOps._count("input_scale")
                 
+                quant_conf = None
                 if comfy_quant_tensor is not None:
+                    Int8TensorwiseOps._count("comfy_quant")
                     try:
                         import json
                         quant_conf = json.loads(bytes(comfy_quant_tensor.tolist()).decode('utf-8'))
+                        Int8TensorwiseOps._debug_layer(prefix, f"comfy_quant={quant_conf}")
                         if quant_conf.get("convrot", False):
                             self._use_convrot = True
+                            Int8TensorwiseOps._count("convrot_layers")
                             Int8TensorwiseOps.enable_convrot = True  # Propagate globally for LoRA
                             if "convrot_groupsize" in quant_conf:
-                                self._convrot_groupsize = quant_conf["convrot_groupsize"]
+                                self._convrot_groupsize = int(quant_conf["convrot_groupsize"])
                                 Int8TensorwiseOps._global_convrot_groupsize = self._convrot_groupsize
-                    except Exception:
-                        pass
+                            group_size = getattr(self, "_convrot_groupsize", CONVROT_GROUP_SIZE)
+                            convrot_warnings = Int8TensorwiseOps._convrot_warnings(group_size, self.in_features)
+                            for warning in convrot_warnings:
+                                Int8TensorwiseOps._count("convrot_warnings")
+                                Int8TensorwiseOps._debug_layer(prefix, f"ConvRot warning: {warning}", force=True)
+                    except Exception as e:
+                        Int8TensorwiseOps._count("comfy_quant_errors")
+                        Int8TensorwiseOps._debug_layer(
+                            prefix,
+                            f"failed to parse comfy_quant {Int8TensorwiseOps._tensor_info(comfy_quant_tensor)}: "
+                            f"{type(e).__name__}: {e}",
+                            force=True,
+                        )
                 
                 pending_weight_lora_patches = None
                 if weight_tensor is not None and weight_tensor.dtype != torch.int8:
@@ -370,6 +529,21 @@ if _COMFY_OPS_AVAILABLE:
                 if weight_tensor is not None:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
                         # Load Quantized
+                        Int8TensorwiseOps._count("prequantized")
+                        scale_warnings = Int8TensorwiseOps._scale_warnings(weight_scale, self.out_features)
+                        for warning in scale_warnings:
+                            Int8TensorwiseOps._count("scale_warnings")
+                            Int8TensorwiseOps._debug_layer(prefix, f"scale warning: {warning}", force=True)
+                        Int8TensorwiseOps._debug_layer(
+                            prefix,
+                            "prequantized int8 load | "
+                            f"weight={Int8TensorwiseOps._tensor_info(weight_tensor)} | "
+                            f"weight_scale={Int8TensorwiseOps._tensor_info(weight_scale, include_stats=True)} | "
+                            f"input_scale={Int8TensorwiseOps._tensor_info(input_scale, include_stats=True)} | "
+                            f"bias={Int8TensorwiseOps._tensor_info(bias_tensor)} | "
+                            f"convrot={getattr(self, '_use_convrot', False)} "
+                            f"group={getattr(self, '_convrot_groupsize', CONVROT_GROUP_SIZE)}"
+                        )
                         self._is_quantized = True
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
@@ -418,9 +592,17 @@ if _COMFY_OPS_AVAILABLE:
                                     Int8TensorwiseOps.applied_lora_patches = set()
                                 Int8TensorwiseOps.applied_lora_patches.add(normalize_key(weight_key))
                         elif not should_quantize:
+                            Int8TensorwiseOps._count("fp_loaded")
+                            Int8TensorwiseOps._debug_layer(
+                                prefix,
+                                "high precision load without INT8 quantization | "
+                                f"weight={Int8TensorwiseOps._tensor_info(weight_tensor)} "
+                                f"excluded={is_excluded} dim1={is_dim1} dynamic_quantize={Int8TensorwiseOps.dynamic_quantize}"
+                            )
                             self._is_quantized = False
                             self.weight = nn.Parameter(source_tensor(weight_tensor), requires_grad=False)
                         else:
+                            Int8TensorwiseOps._count("otf_quantized")
                             # Quantize on the fly
                             device = getattr(Int8TensorwiseOps, "dynamic_load_device", None)
                             if device is None:
@@ -458,9 +640,20 @@ if _COMFY_OPS_AVAILABLE:
                             self._is_per_row = True
                             del w_gpu, q_weight, q_scale
                     else:
+                        if weight_tensor.dtype == torch.int8 and weight_scale is None:
+                            Int8TensorwiseOps._count("missing_scale_for_int8")
+                            Int8TensorwiseOps._debug_layer(
+                                prefix,
+                                "int8 weight has no weight_scale; loading as non-quantized fallback, forward will not use INT8 path | "
+                                f"weight={Int8TensorwiseOps._tensor_info(weight_tensor)} "
+                                f"comfy_quant={quant_conf}",
+                                force=True,
+                            )
                         self._is_quantized = False
                         self.weight = nn.Parameter(source_tensor(weight_tensor), requires_grad=False)
                 else:
+                    Int8TensorwiseOps._count("missing_weight")
+                    Int8TensorwiseOps._debug_layer(prefix, "missing weight tensor", force=True)
                     missing_keys.append(weight_key)
                 
                 # Assign bias if it exists (already patched if needed)
@@ -579,6 +772,14 @@ if _COMFY_OPS_AVAILABLE:
                 if getattr(self, "_use_convrot", False):
                     from .convrot import build_hadamard, rotate_activation
                     group_size = getattr(self, "_convrot_groupsize", CONVROT_GROUP_SIZE)
+                    convrot_warnings = Int8TensorwiseOps._convrot_warnings(group_size, x_2d.shape[-1])
+                    if convrot_warnings:
+                        for warning in convrot_warnings:
+                            Int8TensorwiseOps._debug_layer(
+                                getattr(self, "_debug_prefix", self.__class__.__name__),
+                                f"forward ConvRot warning before rotate_activation: {warning}",
+                                force=True,
+                            )
                     H = build_hadamard(group_size, device=x.device, dtype=x.dtype)
                     x_2d = rotate_activation(x_2d, H, group_size=group_size)
                 
