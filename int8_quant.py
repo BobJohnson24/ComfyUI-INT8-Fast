@@ -646,7 +646,7 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
             if finalize is not None and finalize():
                 finalized += 1
         if finalized > 0:
-            self.size = 0
+            self.size = comfy.model_management.module_size(self.model)
             #logging.info(f"INT8 Fast: Finalized {finalized} deferred INT8 layer(s) at model load time.")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

@@ -11,6 +11,7 @@ import comfy.model_management
 import logging
 
 from .int8_quant import Int8TensorwiseOps
+from .int8_safetensors import load_int8_torch_file
 
 
 class UNetLoaderINTW8A8:
@@ -41,7 +42,7 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load and Quantize INT8 models with fast triton inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", pre_lora=None):
+    def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", pre_lora=None, disable_dynamic=False):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
 
         # Backward compatibility for workflows saved with the old dynamic_lora boolean widget.
@@ -121,8 +122,10 @@ class UNetLoaderINTW8A8:
                 'adaln', 'embedding', 'patchify', 'to_gate_logits', 'proj_out', 'model.audio', 'model.video', 'model.av', 'model.patch', 'model.proj', 'shift', #'transformer_blocks.0.', 'transformer_blocks.46.', # 'transformer_blocks.1.', 'transformer_blocks.47.',
             ]
 
-        # Load state dict once to detect model and prepare LoRA
-        sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+        # Load state dict once to detect model and prepare LoRA. The helper
+        # keeps Comfy's native AIMDO mmap path intact and injects missing
+        # .comfy_quant metadata before custom ops make Comfy skip conversion.
+        sd, metadata = load_int8_torch_file(unet_path)
         
         # Pre-load LoRA if selected to bake it during quantization
         Int8TensorwiseOps.lora_patches = {}
@@ -197,7 +200,12 @@ class UNetLoaderINTW8A8:
         # Load model using the already-loaded state dict
         try:
             Int8TensorwiseOps.applied_lora_patches = set()
-            model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
+            model = comfy.sd.load_diffusion_model_state_dict(
+                sd,
+                model_options=model_options,
+                metadata=metadata,
+                disable_dynamic=disable_dynamic,
+            )
             
             # Print unmatched keys to help with debugging
             if Int8TensorwiseOps.lora_patches:
@@ -222,9 +230,43 @@ class UNetLoaderINTW8A8:
         # Wrap in custom patcher for unified LoRA support
         from .int8_quant import INT8ModelPatcher
         model = INT8ModelPatcher.clone(model)
+        model.cached_patcher_init = (
+            _cached_load_int8_unet,
+            (
+                unet_name,
+                weight_dtype,
+                model_type,
+                on_the_fly_quantization,
+                enable_convrot,
+                lora_mode,
+                pre_lora,
+            ),
+        )
         model._safetensors_metadata = metadata  # stash for save node
         
         return (model,)
+
+
+def _cached_load_int8_unet(
+    unet_name,
+    weight_dtype,
+    model_type,
+    on_the_fly_quantization,
+    enable_convrot=False,
+    lora_mode="None",
+    pre_lora=None,
+    disable_dynamic=False,
+):
+    return UNetLoaderINTW8A8().load_unet(
+        unet_name,
+        weight_dtype,
+        model_type,
+        on_the_fly_quantization,
+        enable_convrot,
+        lora_mode,
+        pre_lora,
+        disable_dynamic=disable_dynamic,
+    )[0]
 
 
 class PreLoraLoader:
