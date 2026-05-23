@@ -26,7 +26,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "ernie", "anima", "hidream o1"], {"tooltip": "Only used for on the fly quantization, to filter sensitive layers."}),
+                "model_type": (["flux2", "z-image", "z-image-l2p", "chroma", "wan", "ltx2", "qwen", "ernie", "anima"], {"tooltip": "Only used for on the fly quantization, to filter sensitive layers."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize a higher precision model to INT8. If the selected model is already INT8 keep unchecked."}),
                 "enable_convrot": ("BOOLEAN", {"default": True, "tooltip": "Enable ConvRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
                 "lora_mode": (["None", "Stochastic", "Dynamic"], {"default": "None", "tooltip": "None bakes LoRA patches with normal rounding which is the default behavior. Stochastic bakes with stochastic INT8 rounding, which can occasionally be closer to the BF16+lora baseline. Dynamic applies LoRA at inference time, which is slow and only works for conventional lora."}),
@@ -89,6 +89,12 @@ class UNetLoaderINTW8A8:
                 'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
                 'final_layer', 'noise_refiner', 'adaLN',
                 'x_pad_token', 'layers.0.',
+            ]
+        elif model_type == "z-image-l2p":
+            Int8TensorwiseOps.excluded_names = [
+        'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner',
+        'noise_refiner', 'adaLN', 'x_pad_token',
+        'local_decoder',
             ]
         elif model_type == "chroma":
             Int8TensorwiseOps.excluded_names = [
