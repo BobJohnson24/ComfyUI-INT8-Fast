@@ -221,6 +221,7 @@ if _COMFY_OPS_AVAILABLE:
                 self._use_convrot = False  # Track if ConvRot was applied
                 self._weight_scale_scalar = None  # For scalar (non-tensor) scales
                 self.compute_dtype = torch.bfloat16
+                self.comfy_cast_weights = False
                 self.lora_patches = []  # List of (down_scaled, up, start, size) set by INT8ModelPatcher
             
             def reset_parameters(self):
@@ -421,8 +422,8 @@ if _COMFY_OPS_AVAILABLE:
                             if weight_scale.numel() == 1:
                                 # Scalar scale — store as float for speed
                                 self._weight_scale_scalar = weight_scale.float().item()
-                                self.weight_scale = None
-                                self._is_per_row = False if per_row_hint is None else per_row_hint
+                                self.register_buffer('weight_scale', weight_scale.float().reshape(1))
+                                self._weight_scale_scalar = None
                             elif weight_scale.dim() == 2 and weight_scale.shape[1] == 1:
                                 self.register_buffer('weight_scale', weight_scale.float())
                                 self._weight_scale_scalar = None
@@ -432,7 +433,10 @@ if _COMFY_OPS_AVAILABLE:
                                 self._weight_scale_scalar = None
                                 self._is_per_row = False if per_row_hint is None else per_row_hint
                         else:
-                            self._weight_scale_scalar = float(weight_scale)
+                            self.weight_scale = nn.Parameter(
+                                torch.tensor(float(weight_scale), dtype=torch.float32), 
+                                requires_grad=False
+                            )
                             self.weight_scale = None
                             self._is_per_row = False if per_row_hint is None else per_row_hint
                             
@@ -529,9 +533,6 @@ if _COMFY_OPS_AVAILABLE:
                     self.bias_comfy_model_dtype = self.bias.dtype
 
             def _get_weight_scale(self):
-                """Get weight scale, preferring scalar if available."""
-                if self._weight_scale_scalar is not None:
-                    return self._weight_scale_scalar
                 return self.weight_scale
 
             def convert_weight(self, _weight, inplace=False):
