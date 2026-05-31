@@ -198,8 +198,8 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
     # Ensure weight_scale is a tensor on device
     if not isinstance(weight_scale, torch.Tensor):
         weight_scale = torch.tensor([weight_scale], device=x.device, dtype=torch.float32)
-    elif weight_scale.numel() == 1:
-        weight_scale = weight_scale.reshape(1)
+    else:
+        weight_scale = weight_scale.to(x.device, non_blocking=True).reshape(1) if weight_scale.numel() == 1 else weight_scale.to(x.device, non_blocking=True)
 
     # 5. Kernel 2: Fused GEMM + Dequant
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
