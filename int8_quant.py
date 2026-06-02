@@ -887,6 +887,16 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
                 # fused QKV layers where each of Q/K/V targets a different output slice.
                 weight = comfy.utils.get_attr(self.model, key)
                 device = weight.device if weight is not None else self.offload_device
+
+                # Cache key from the raw adapter patch objects (stable identity across steps)
+                cache_key = tuple(id(p[1]) for p in patches)
+
+                if getattr(module, "_lora_cache_key", None) == cache_key:
+                    # Same LoRA adapters, tensors already on device — skip reassignment
+                    if return_weight:
+                        return comfy.utils.get_attr(self.model, key)
+                    return
+
                 lora_patches = []
                 for p in patches:
                     strength_patch = p[0]  # float
@@ -929,6 +939,7 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
                         lora_patches.append((down_scaled.to(device), up.flatten(1).to(device), start, size))
 
                 module.lora_patches = lora_patches
+                module._lora_cache_key = cache_key
                 if return_weight:
                     return weight
                 return  # Skip standard weight-merging path
