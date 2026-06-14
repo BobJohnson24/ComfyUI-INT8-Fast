@@ -1018,6 +1018,29 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
         
         device_to = kwargs.get("device_to", args[0] if len(args) > 0 else self.model.device)
         
+        self._reinstall_int8_lowvram_patches(device_to)
+        
+        return res
+
+    def _reinstall_int8_lowvram_patches(self, device_to=None):
+        """Replace ComfyUI's stock LowVramPatch with our scale-aware INT8LowVramPatch
+        on every patched INT8 layer.
+
+        ComfyUI core installs a vanilla ``LowVramPatch`` whose ``__call__`` runs
+        ``calculate_weight(..., intermediate_dtype=weight.dtype)``. For an INT8
+        weight that intermediate dtype is ``torch.int8``, so the LoRA matmul hits
+        ``addmm_cuda not implemented for 'Char'`` (issue #76). We strip those stock
+        patches and route through INT8LowVramPatch, which dequantizes -> patches ->
+        re-quantizes with the per-row scale.
+
+        This must run after EVERY core path that can (re)install LowVramPatch on an
+        offloaded module: ``load()`` and ``partially_unload()``. The latter installs
+        the stock patch directly (model_patcher.py) without calling ``load()``, which
+        is why the crash was intermittent -- it only surfaced when memory pressure
+        triggered a partial unload of a patched layer.
+        """
+        save_materialized = bool(getattr(self, "_int8_save_materialized_lora", False))
+        
         for name, module in self.model.named_modules():
             if hasattr(module, "_is_quantized") and module._is_quantized:
                 weight_key = name + ".weight"
@@ -1048,7 +1071,13 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
                         if pin_state is not None:
                             lowvram_patch._pin_state = pin_state
                         module.weight_lowvram_function = lowvram_patch
-                    
+
+    def partially_unload(self, device_to, *args, **kwargs):
+        # ComfyUI core's partially_unload() re-installs a stock LowVramPatch on
+        # offloaded INT8 layers without going through load(), so re-run our swap
+        # to keep the scale-aware INT8LowVramPatch in place (issue #76).
+        res = super().partially_unload(device_to, *args, **kwargs)
+        self._reinstall_int8_lowvram_patches(device_to)
         return res
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
