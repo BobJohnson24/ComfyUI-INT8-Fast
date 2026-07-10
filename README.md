@@ -3,15 +3,19 @@ https://github.com/Comfy-Org/ComfyUI/commit/1a510f04234e5a213d3985a1a54f65652623
 
 No, I did not help at all with this and had no involvement. My **existing quants are likely to not work** due to a quant naming missmatch, but [silveroxides](https://huggingface.co/silveroxides) are likely to work as they were quite involved in the process of making this happen.
 
-Existing INT8 fast quants can be converted to the proper native format via this script https://github.com/BobJohnson24/ComfyUI-INT8-Fast/blob/main/convert_to_comfy.py
-
-```
-python convert_comfy_quant.py I8Fast.safetensors I8Comfy.safetensors
-or
-python convert_comfy_quant.py I8Fast.safetensors --inplace
-```
+The "Save Int8 Model" node now writes the proper native `comfy_quant` metadata directly, so saved checkpoints load with the stock "Load Diffusion Model" node (the old `convert_to_comfy.py` script has been removed).
 
 I am glad to retire with a Piña colada in my hands, on the beach. Might slim this node down to an exclusively pre-lora focused node in the future, if that does not become a default comfy feature.
+
+# NEW: INT W4A4 + 20% INT8 Mixed conversion
+
+The **"Convert INT4 W4A4 + 20% INT8 Mixed (Native)"** node converts a bf16/fp16 model into the mixed-precision INT4 format from [ConvRot (arXiv:2512.03673)](https://arxiv.org/html/2512.03673v1): ~80% of linear layers are stored as `convrot_w4a4` (regular-Hadamard rotation + group-64 INT4, [ComfyUI PR #14859](https://github.com/Comfy-Org/ComfyUI/pull/14859)) and ~20% as `int8_tensorwise` W8A8 ([ComfyUI PR #14636](https://github.com/Comfy-Org/ComfyUI/pull/14636)), which restores the fine detail lost under full INT4. Model-specific sensitive layers (embedders, modulation/adaLN, final layers) stay at source precision.
+
+- **selection**: `structural` (default) spends the INT8 budget on the first/last transformer blocks and the attention-out / MLP-down projections, ends-inward — the layers where INT4 activation error hurts most. `calibrated` runs a short sampling pass (connect `calib_model` — the same file loaded in bf16 with the stock loader — plus `calib_positive`/`calib_negative`/`calib_latent`) and measures each layer's actual rotated-activation INT4 error; most accurate, model-specific. `sensitivity` is a weight-only error ranking; `random` matches the paper's Table 2 subset.
+- **linear_dtype**: `int4` uses int4 tensor cores where supported (fallback to int8 on GPUs that don't); `int8` forces the matmul in int8 for higher quality at the same 4-bit storage. If quality is lacking, try `int8` first.
+- **int8_ratio**: 0.20 is the paper setting; raise to 0.3–0.5 for sensitive models (z-image benefits).
+- The chosen INT8 layers are recorded in the checkpoint metadata (`int8_selected_layers`) so runs are comparable.
+- Output is fully native — load it with the stock "Load Diffusion Model" node. Requires ComfyUI with comfy-kitchen >= 0.2.17.
 
 # Comfy INT8 Acceleration
 
