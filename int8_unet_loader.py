@@ -12,6 +12,54 @@ import logging
 
 from .int8_quant import Int8TensorwiseOps
 
+# Layer-name substrings that must stay in high precision, per model family.
+# Shared by UNetLoaderINTW8A8 (on-the-fly W8A8) and INT4W4A4MixedSave (offline
+# W4A4 + INT8 mixed conversion).
+MODEL_TYPE_EXCLUSIONS = {
+    "flux2": [
+        'img_in', 'time_in', 'guidance_in', 'txt_in',
+        'double_stream_modulation_img', 'double_stream_modulation_txt',
+        'single_stream_modulation',
+    ],
+    "z-image": [
+        'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner',
+        'final_layer', 'noise_refiner', 'adaLN',
+        'x_pad_token', 'layers.0.',
+    ],
+    "chroma": [
+        'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in', 'nerf_image_embedder',
+        'nerf_blocks', 'nerf_final_layer_conv', '__x0__', 'nerf_final_layer_conv',
+    ],
+    "qwen": [
+        'time_text_embed', 'img_in', 'norm_out', 'proj_out', 'txt_in',
+    ],
+    "ernie": [
+        'time', 'x_embedder', 'text_proj', 'adaLN',
+    ],
+    "anima": [
+        'embed', 'llm', 'adaln',
+    ],
+    "krea2": [
+        'first', 'last', 'tmlp', 'tproj', 'txtfusion', 'txtmlp',
+    ],
+    "hidream o1": [
+        'embed', 'language_model.layers.35.mlp',
+    ],
+    "boogu": [
+        'embed', 'refine', 'norm_out',
+    ],
+    "ideogram4": [
+        'embed_image_indicator', 't_embedding', 'proj', 'final_layer', 'adaLN', 'modulation', 'norm',
+    ],
+    "wan": [
+        'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head',
+        'img_emb', 'face_adapter', 'face_encoder', 'motion_encoder', 'pose_patch_embedding',
+    ],
+    "ltx2": [
+        'adaln', 'embedding', 'patchify', 'to_gate_logits', 'proj_out', 'model.audio', 'model.video', 'model.av', 'model.patch', 'model.proj', 'shift', #'transformer_blocks.0.', 'transformer_blocks.46.', # 'transformer_blocks.1.', 'transformer_blocks.47.',
+    ],
+}
+
 
 def _load_int8_unet_cached_patcher(unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot, lora_mode, pre_lora=None, disable_dynamic=False):
     return UNetLoaderINTW8A8().load_unet(
@@ -98,60 +146,7 @@ class UNetLoaderINTW8A8:
             delattr(Int8TensorwiseOps, "_logged_otf")
         
         # Check explicit model_type for exclusions
-        if model_type == "flux2":
-            Int8TensorwiseOps.excluded_names = [
-                'img_in', 'time_in', 'guidance_in', 'txt_in', 
-                'double_stream_modulation_img', 'double_stream_modulation_txt', 
-                'single_stream_modulation',
-            ]
-        elif model_type == "z-image":
-            Int8TensorwiseOps.excluded_names = [
-                'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
-                'final_layer', 'noise_refiner', 'adaLN',
-                'x_pad_token', 'layers.0.',
-            ]
-        elif model_type == "chroma":
-            Int8TensorwiseOps.excluded_names = [
-                'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in', 'nerf_image_embedder',
-                 'nerf_blocks', 'nerf_final_layer_conv', '__x0__', 'nerf_final_layer_conv',
-            ]
-        elif model_type == "qwen":
-            Int8TensorwiseOps.excluded_names = [
-                'time_text_embed', 'img_in', 'norm_out', 'proj_out', 'txt_in'
-            ]
-        elif model_type == "ernie":
-            Int8TensorwiseOps.excluded_names = [
-                'time', 'x_embedder', 'text_proj', 'adaLN',
-            ]
-        elif model_type == "anima":
-            Int8TensorwiseOps.excluded_names = [
-                'embed', 'llm', 'adaln',
-            ]
-        elif model_type == "krea2":
-            Int8TensorwiseOps.excluded_names = [
-                'first', 'last', 'tmlp', 'tproj', 'txtfusion', 'txtmlp'
-            ]
-        elif model_type == "hidream o1":
-            Int8TensorwiseOps.excluded_names = [
-                'embed', 'language_model.layers.35.mlp',
-            ]
-        elif model_type == "boogu":
-            Int8TensorwiseOps.excluded_names = [
-                'embed', 'refine', 'norm_out',
-            ]
-        elif model_type == "ideogram4":
-            Int8TensorwiseOps.excluded_names = [
-                'embed_image_indicator', 't_embedding', 'proj',
-            ]
-        elif model_type == "wan":
-            Int8TensorwiseOps.excluded_names = [
-                'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head',
-                'img_emb', 'face_adapter', 'face_encoder', 'motion_encoder', 'pose_patch_embedding',
-            ]
-        elif model_type == "ltx2":
-            Int8TensorwiseOps.excluded_names = [
-                'adaln', 'embedding', 'patchify', 'to_gate_logits', 'proj_out', 'model.audio', 'model.video', 'model.av', 'model.patch', 'model.proj', 'shift', #'transformer_blocks.0.', 'transformer_blocks.46.', # 'transformer_blocks.1.', 'transformer_blocks.47.',
-            ]
+        Int8TensorwiseOps.excluded_names = list(MODEL_TYPE_EXCLUSIONS.get(model_type, []))
 
         # Load state dict once to detect model and prepare LoRA
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
