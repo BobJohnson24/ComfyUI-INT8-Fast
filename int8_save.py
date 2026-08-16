@@ -218,7 +218,10 @@ class INT8ModelSave:
 
                 if getattr(module, "_is_quantized", False):
                     use_convrot = bool(getattr(module, "_use_convrot", False))
-                    quant_conf = {"convrot": use_convrot}
+                    # comfy.ops dispatches on this key; without it core's
+                    # UNETLoader raises "Unknown quantization format" and the
+                    # checkpoint only loads through our own loader.
+                    quant_conf = {"format": "int8_tensorwise", "convrot": use_convrot}
                     # Always emit a groupsize when convrot is on, even if the
                     # module is using the default. Older save paths only wrote
                     # this field when ``_convrot_groupsize`` had been set
