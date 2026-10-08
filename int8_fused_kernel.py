@@ -1,3 +1,4 @@
+import inspect
 import torch
 import triton
 import triton.language as tl
@@ -77,6 +78,16 @@ def triton_quantize_rowwise(x: torch.Tensor):
 # Kernel 2: INT8 GEMM + Fused Dequantization Epilogue
 # =============================================================================
 
+# Autotune on M rounded up to a multiple of 128 instead of the exact M. M is the token count, so with
+# key=['M', ...] every new prompt length re-ran the full autotune for every layer shape (~4 s per new
+# prompt on Krea2). Results are identical for every config, since the int8 products accumulate exactly.
+_AUTOTUNE_KWARGS = {"cache_results": True} if "cache_results" in inspect.signature(triton.autotune).parameters else {}
+
+
+def _m_bucket(m):
+    return (m + 127) // 128 * 128
+
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
@@ -86,7 +97,8 @@ def triton_quantize_rowwise(x: torch.Tensor):
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     ],
-    key=['M', 'N', 'K'],
+    key=['M_BUCKET', 'N', 'K'],
+    **_AUTOTUNE_KWARGS,
 )
 @triton.jit
 def _int8_matmul_dequant_kernel(
@@ -94,7 +106,7 @@ def _int8_matmul_dequant_kernel(
     a_ptr, b_ptr, c_ptr,
     a_scale_ptr, b_scale_ptr, bias_ptr,
     # Matrix Dimensions
-    M, N, K,
+    M, N, K, M_BUCKET,
     # Strides
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -222,7 +234,7 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
         b_scale_ptr=weight_scale, 
         bias_ptr=bias_ptr,
         # Shapes
-        M=M, N=N, K=K,
+        M=M, N=N, K=K, M_BUCKET=_m_bucket(M),
         # Strides
         stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
         stride_bk=weight.stride(1), stride_bn=weight.stride(0), # Transposed access of W
@@ -248,7 +260,8 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     ],
-    key=['M', 'N', 'K'],
+    key=['M_BUCKET', 'N', 'K'],
+    **_AUTOTUNE_KWARGS,
 )
 @triton.jit
 def _int8_matmul_dequant_per_row_kernel(
@@ -256,7 +269,7 @@ def _int8_matmul_dequant_per_row_kernel(
     a_ptr, b_ptr, c_ptr,
     a_scale_ptr, b_scale_ptr, bias_ptr,
     # Matrix Dimensions
-    M, N, K,
+    M, N, K, M_BUCKET,
     # Strides
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -361,7 +374,7 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
         a_scale_ptr=x_scale,
         b_scale_ptr=ws,
         bias_ptr=bias_ptr,
-        M=M, N=N, K=K,
+        M=M, N=N, K=K, M_BUCKET=_m_bucket(M),
         stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
         stride_bk=weight.stride(1), stride_bn=weight.stride(0),
         stride_cm=output.stride(0), stride_cn=output.stride(1),
