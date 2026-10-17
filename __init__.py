@@ -85,12 +85,19 @@ try:
     from .int8_unet_loader import UNetLoaderINTW8A8, PreLoraLoader
     from .int8_lora import INT8GroupedLora
     from .int8_save import INT8ModelSave
-    
+    from .int4_mixed_convert import INT4W4A4MixedSave
+    from .w4a8_codebook_convert import W4A8CodebookSave, W6A8Save
+    from .te_quant_convert import TextEncoderQuantSave
+
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
         "INT8GroupedLora": INT8GroupedLora,
         "INT8ModelSave": INT8ModelSave,
         "INT8PreLoraLoader": PreLoraLoader,
+        "INT4W4A4MixedSave": INT4W4A4MixedSave,
+        "W4A8CodebookSave": W4A8CodebookSave,
+        "W6A8Save": W6A8Save,
+        "TextEncoderQuantSave": TextEncoderQuantSave,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
@@ -98,6 +105,10 @@ try:
         "INT8GroupedLora": "INT8 Grouped LoRA",
         "INT8ModelSave": "Save Int8 Model",
         "INT8PreLoraLoader": "INT8 Pre-Lora Loader",
+        "INT4W4A4MixedSave": "Convert INT4 W4A4 + 20% INT8 Mixed (Native)",
+        "W4A8CodebookSave": "Convert W4A8 Codebook (Kitchen)",
+        "W6A8Save": "Convert W6A8 (Kitchen)",
+        "TextEncoderQuantSave": "Convert Text Encoder / LLM (INT8 / W4A8 / W6A8 ConvRot)",
     }
 except ImportError as e:
     logging.error(f"Int88: Failed to import nodes: {e}")
